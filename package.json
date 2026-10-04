@@ -1,0 +1,13 @@
+{
+  "name": "lp-kokoelma",
+  "version": "1.0.0",
+  "description": "LP-levykokoelman hallinta – offline-toimiva PWA, CSV-tietolähde, kansikuvat ja pilvisynkronointi",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "python3 -m http.server 8080",
+    "test": "node --test tests/*.test.js"
+  },
+  "engines": { "node": ">=20" }
+}

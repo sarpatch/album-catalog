@@ -1,0 +1,19 @@
+{
+  "name": "Levyhylly – LP-kokoelma",
+  "short_name": "Levyhylly",
+  "description": "LP-levykokoelman hallinta: haku, kansikuvat, kuntoluokitus ja synkronointi.",
+  "lang": "fi",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#1d1c1a",
+  "theme_color": "#1d1c1a",
+  "categories": ["music", "lifestyle", "utilities"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
