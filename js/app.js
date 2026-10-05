@@ -1,11 +1,20 @@
-// LP-kokoelma – sovelluksen pääosa: tila, näkymät ja toiminnot.
+// Levyhylly – sovelluksen pääosa: tila, näkymät ja toiminnot.
+// Kaikki kenttiä koskeva tulee kenttämäärittelystä (kentat.json), joten uudet kentät
+// toimivat lomakkeessa, taulukossa, suodatuksessa, tilastoissa ja CSV:ssä ilman koodimuutoksia.
 
 import { db, requestPersistence } from './db.js';
 import { CONFIG } from './config.js';
 import {
-  FIELDS, LABELS, FORMATS, SIZES, SPEEDS, GRADES, SORTS, emptyRecord, newId, nowIso,
-  normalizeRecord, validateRecord, fromImportRow, duplicateKey, matchesQuery, computeStats,
+  GRADES, CHECKED, SCHEMA_FILE, FALLBACK_SCHEMA, normalizeSchema, parseSchema, schemaToJSON, mergeSchemas,
+  fieldMap, formatValue, formatMoney, editableText, csvColumns, SYSTEM_FIELDS,
+} from './schema.js';
+import {
+  emptyRecord, newId, nowIso, normalizeRecord, validateRecord, fromImportRow, mapHeaders, fieldsForHeaders,
+  duplicateKey, computeStats,
 } from './model.js';
+import {
+  applyView, sortRecords, isActive, activeFilterCount, describeFilter, SYSTEM_SORT_FIELDS,
+} from './query.js';
 import { parseCSVObjects, toCSV } from './csv.js';
 import { createZip, readZip } from './zip.js';
 import { makeThumb, shortHash, coverPath } from './image.js';
@@ -13,14 +22,18 @@ import { openCropper } from './cropper.js';
 import { SyncEngine, recordsToCSV, CSV_NAME } from './sync.js';
 import { BACKENDS, getBackend } from './backends/index.js';
 import { dropboxBackend } from './backends/dropbox.js';
+import { DataTable, DEFAULT_WIDTHS, renderValue } from './table.js';
+import { filterEditor } from './filters.js';
+import { openFieldEditor } from './fieldeditor.js';
 import {
   THEMES, AUTO_THEME, CUSTOM_ID, FONT_NAMES, resolveTheme, applyTheme, customTheme, themeVars,
 } from './themes.js';
 import {
-  h, icon, toast, openDialog, confirmDialog, choiceDialog, debounce, formatDate, formatMoney, saveFile, pickFile,
+  h, icon, toast, openDialog, confirmDialog, choiceDialog, openPopover, closePopover, debounce, formatDate,
+  saveFile, pickFile,
 } from './ui.js';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 // ── Tila ───────────────────────────────────────────────────────────────────
 const DEFAULT_SETTINGS = {
@@ -31,25 +44,40 @@ const DEFAULT_SETTINGS = {
   theme: 'auto',
   customTheme: { scheme: 'light', bg: '#faf7f2', text: '#1d1c1a', accent: '#7c3aed', font: 'sans', radius: '12px' },
   view: 'grid',
-  sort: 'artist',
+  sort: [],
+  filters: {},
+  columns: {},
   lastExportAt: null,
 };
 
 const state = {
-  settings: { ...DEFAULT_SETTINGS },
+  settings: structuredClone(DEFAULT_SETTINGS),
+  schema: normalizeSchema(FALLBACK_SCHEMA).schema,
+  schemaCustom: false,
+  schemaWarnings: [],
   records: [],
   thumbs: new Map(), // id → object URL
   query: '',
-  filters: { genre: '', format: '', grade: '' },
+  frozenIds: null, // taulukossa muokattaessa rivien järjestys pidetään paikallaan
+  undo: [],
+  table: null,
 };
 
 const darkQuery = matchMedia('(prefers-color-scheme: dark)');
 const $ = (sel) => document.querySelector(sel);
+const fields = () => fieldMap(state.schema);
+const visibleFields = () => state.schema.fields.filter((f) => !f.hidden);
 
-const sync = new SyncEngine({ store: db, makeThumb, onStatus: renderSyncStatus });
+const sync = new SyncEngine({
+  store: db,
+  makeThumb,
+  onStatus: renderSyncStatus,
+  getSchema: () => state.schema,
+  setSchema: (schema) => applySchema(schema, { sync: false }),
+});
 const scheduleSync = debounce(() => sync.sync().then(afterSync), 2500);
 
-async function saveSettings(patch) {
+async function saveSettings(patch = {}) {
   Object.assign(state.settings, patch);
   await db.setMeta('settings', state.settings);
 }
@@ -58,11 +86,111 @@ function currentBackend() {
   return getBackend(state.settings.backend, state.settings);
 }
 
+function migrateSettings(s) {
+  if (typeof s.sort === 'string') {
+    s.sort = {
+      title: [{ key: 'title', dir: 'asc' }], year: [{ key: 'year', dir: 'asc' }], yearDesc: [{ key: 'year', dir: 'desc' }],
+      added: [{ key: 'created_at', dir: 'desc' }], location: [{ key: 'location', dir: 'asc' }],
+    }[s.sort] || [];
+  }
+  if (!Array.isArray(s.sort)) s.sort = [];
+  if (s.view === 'list') s.view = 'table';
+  s.filters = s.filters && typeof s.filters === 'object' ? s.filters : {};
+  s.columns = s.columns && typeof s.columns === 'object' ? s.columns : {};
+  return s;
+}
+
 // ── Teema ──────────────────────────────────────────────────────────────────
 function refreshTheme() {
   applyTheme(resolveTheme(state.settings, darkQuery.matches));
 }
 darkQuery.addEventListener('change', refreshTheme);
+
+// ── Kenttämäärittely ────────────────────────────────────────────────────────
+async function siteSchema() {
+  try {
+    const res = await fetch(SCHEMA_FILE, { cache: 'no-cache' });
+    if (res.ok) {
+      const { schema, warnings } = parseSchema(await res.text());
+      state.schemaWarnings = warnings;
+      return schema;
+    }
+  } catch (e) {
+    console.warn('kentat.json-tiedostoa ei voitu ladata', e);
+  }
+  return normalizeSchema(FALLBACK_SCHEMA).schema;
+}
+
+async function loadSchema() {
+  const saved = await db.getMeta('schema', null);
+  if (saved?.fields) {
+    state.schema = normalizeSchema(saved).schema;
+    state.schemaCustom = true;
+  } else {
+    state.schema = await siteSchema();
+  }
+}
+
+/** Ottaa uuden kenttämäärittelyn käyttöön (sovelluksesta, tuonnista tai synkronoinnista). */
+async function applySchema(schema, { sync: doSync = true } = {}) {
+  state.schema = schema;
+  state.schemaCustom = true;
+  await db.setMeta('schema', schema);
+  state.frozenIds = null;
+  render();
+  if (doSync) scheduleSync();
+}
+
+async function resetSchema() {
+  if (!(await confirmDialog('Kentät palautetaan sovelluksen oletuksiin. Omien kenttien arvot säilyvät CSV-tiedostossa.', { title: 'Palauta oletuskentät', ok: 'Palauta' }))) return false;
+  await db.setMeta('schema', null);
+  state.schemaCustom = false;
+  const s = await siteSchema();
+  s.updated_at = nowIso();
+  await applySchema(s);
+  await db.setMeta('schema', null);
+  state.schemaCustom = false;
+  toast('Oletuskentät palautettu');
+  return true;
+}
+
+function schemaLocationText() {
+  const b = currentBackend();
+  return b.id === 'local' ? 'tällä laitteella' : `${b.label}: ${state.settings.remoteFolder || ''}/${SCHEMA_FILE}`.replace('//', '/');
+}
+
+function exportSchema() {
+  saveFile(new Blob([schemaToJSON(state.schema)], { type: 'application/json' }), SCHEMA_FILE, { share: false });
+}
+
+async function importSchema() {
+  const file = await pickFile('.json,application/json');
+  if (!file) return;
+  try {
+    const { schema, warnings } = parseSchema(await file.text());
+    if (!(await confirmDialog(`Nykyiset ${state.schema.fields.length} kenttää korvataan tiedoston ${schema.fields.length} kentällä. Levyjen tiedot säilyvät.${warnings.length ? `\n\nHuomautukset:\n• ${warnings.join('\n• ')}` : ''}`, { title: 'Tuo kentat.json', ok: 'Korvaa kentät' }))) return;
+    schema.updated_at = nowIso();
+    await applySchema(schema);
+    toast('Kentät tuotu');
+  } catch (e) {
+    toast(e.message, { kind: 'error', timeout: 8000 });
+  }
+}
+
+function openFields() {
+  closePopover();
+  openFieldEditor({
+    schema: state.schema,
+    locationText: schemaLocationText(),
+    onSave: async (schema, warnings) => {
+      await applySchema(schema);
+      toast(warnings.length ? `Kentät tallennettu. Huom: ${warnings[0]}` : 'Kentät tallennettu');
+    },
+    onExport: exportSchema,
+    onImport: importSchema,
+    onReset: resetSchema,
+  });
+}
 
 // ── Tietojen lataus ─────────────────────────────────────────────────────────
 async function loadAll() {
@@ -75,18 +203,231 @@ async function loadAll() {
 }
 
 async function afterSync(result) {
-  if (result?.changed) { await loadAll(); render(); }
+  if (!result) return;
+  if (result.schema?.error) toast(`${SCHEMA_FILE}: ${result.schema.error}`, { kind: 'error', timeout: 10000 });
+  if (result.schema?.warnings?.length) {
+    state.schemaWarnings = result.schema.warnings;
+    if (result.schema.changed) toast(`Kentät päivitetty. Huom: ${result.schema.warnings[0]}`, { timeout: 8000 });
+  } else if (result.schema?.changed) {
+    state.schemaWarnings = [];
+    toast('Kenttämäärittely päivittyi');
+  }
+  if (result.changed) {
+    await loadAll();
+    state.frozenIds = null;
+    render();
+  }
+}
+
+// ── Näkymän tiedot ──────────────────────────────────────────────────────────
+function freshView() {
+  return applyView(state.records, state.schema, { query: state.query, filters: state.settings.filters, sort: state.settings.sort });
+}
+
+function visibleRecords() {
+  if (state.frozenIds) {
+    const byId = new Map(state.records.map((r) => [r.id, r]));
+    return state.frozenIds.map((id) => byId.get(id)).filter(Boolean);
+  }
+  return freshView();
+}
+
+function tableColumns() {
+  return visibleFields()
+    .filter((f) => !(state.settings.columns[f.key]?.hidden ?? f.table === false))
+    .map((f) => ({ field: f, width: state.settings.columns[f.key]?.width ?? f.width ?? DEFAULT_WIDTHS[f.type] ?? 140 }));
+}
+
+function uniqueValues(key) {
+  return [...new Set(state.records.map((r) => r[key]).filter(Boolean))].sort((a, b) => String(a).localeCompare(String(b), 'fi'));
+}
+
+function setFilter(key, f) {
+  const filters = { ...state.settings.filters };
+  if (f) filters[key] = f; else delete filters[key];
+  state.settings.filters = filters;
+  state.frozenIds = null;
+  saveSettings();
+  render();
+}
+
+function clearFilters() {
+  state.query = '';
+  $('#search').value = '';
+  state.settings.filters = {};
+  state.frozenIds = null;
+  saveSettings();
+  render();
+}
+
+function setSort(sort) {
+  state.settings.sort = sort;
+  state.frozenIds = null;
+  saveSettings();
+  render();
+}
+
+/** Otsikon napautus: nouseva → laskeva → ei järjestystä. Shift lisää toissijaisen järjestyksen. */
+function toggleSort(key, additive) {
+  let sort = [...state.settings.sort];
+  const i = sort.findIndex((s) => s.key === key);
+  if (!additive) {
+    const cur = sort[0]?.key === key ? sort[0].dir : null;
+    sort = cur === 'asc' ? [{ key, dir: 'desc' }] : cur === 'desc' ? [] : [{ key, dir: 'asc' }];
+  } else if (i < 0) sort.push({ key, dir: 'asc' });
+  else if (sort[i].dir === 'asc') sort[i] = { key, dir: 'desc' };
+  else sort.splice(i, 1);
+  setSort(sort);
+}
+
+// ── Muokkaus taulukossa ─────────────────────────────────────────────────────
+async function commitChanges(changes, { paste = false, skipped = 0, undo = false } = {}) {
+  if (!changes.length) return;
+  if (!state.frozenIds && state.settings.view === 'table') state.frozenIds = visibleRecords().map((r) => r.id);
+  const byId = new Map(state.records.map((r) => [r.id, r]));
+  const touched = new Map();
+  const now = nowIso();
+  for (const c of changes) {
+    const base = touched.get(c.id) || byId.get(c.id);
+    if (base) touched.set(c.id, { ...base, [c.key]: c.value, updated_at: now });
+  }
+  if (!touched.size) return;
+  state.records = state.records.map((r) => touched.get(r.id) || r);
+  if (!undo) {
+    state.undo.push(changes);
+    if (state.undo.length > 100) state.undo.shift();
+  }
+  state.table?.patch([...touched.values()]);
+  renderChrome();
+  try {
+    await db.putRecords([...touched.values()]);
+  } catch (e) {
+    toast(`Tallennus epäonnistui: ${e.message}`, { kind: 'error' });
+    return;
+  }
+  scheduleSync();
+  if (paste) {
+    toast(`Liitetty ${changes.length} ${changes.length === 1 ? 'arvo' : 'arvoa'}${skipped ? `, ${skipped} ohitettu virheellisinä` : ''}`, { action: 'Kumoa', onAction: undoLast });
+  }
+}
+
+function undoLast() {
+  const last = state.undo.pop();
+  if (!last) { toast('Ei kumottavaa'); return; }
+  commitChanges([...last].reverse().map((c) => ({ id: c.id, key: c.key, value: c.old, old: c.value })), { undo: true });
+  toast('Muutos kumottu');
+}
+
+function createTable() {
+  return new DataTable({
+    onOpen: (id) => openDetail(id),
+    onCommit: (changes, meta) => commitChanges(changes, meta),
+    onSort: toggleSort,
+    onFilter: (key, anchor) => openFieldFilter(key, anchor),
+    onResize: (key, width) => {
+      state.settings.columns = { ...state.settings.columns, [key]: { ...state.settings.columns[key], width } };
+      saveSettings();
+    },
+    onError: (msg) => toast(msg, { kind: 'error' }),
+    thumb: (id) => state.thumbs.get(id) || null,
+    suggestions: uniqueValues,
+    emptyText: () => 'Ei osumia nykyisellä haulla ja suodattimilla.',
+  });
+}
+
+// ── Suodatusvalikot ─────────────────────────────────────────────────────────
+function recordsForFilter(key) {
+  const others = { ...state.settings.filters };
+  delete others[key];
+  return applyView(state.records, state.schema, { query: state.query, filters: others });
+}
+
+function openFieldFilter(key, anchor) {
+  const field = fields().get(key);
+  if (!field) return;
+  const primary = state.settings.sort[0];
+  openPopover(anchor, {
+    title: field.label,
+    className: 'filter-pop',
+    body: filterEditor({
+      field,
+      records: recordsForFilter(key),
+      filter: state.settings.filters[key],
+      onChange: (f) => setFilter(key, f),
+      sortDir: primary?.key === key ? primary.dir : null,
+      onSort: (dir) => setSort([{ key, dir }]),
+    }),
+  });
+}
+
+function openFilterPanel() {
+  const F = visibleFields();
+  const body = h('div', { class: 'filter-panel' },
+    h('p', { class: 'hint' }, 'Suodata minkä tahansa kentän mukaan. Taulukkonäkymässä saman valikon saa myös sarakeotsikon suppilosta.'),
+    F.map((field) => {
+      const desc = h('span', { class: 'fp-desc' });
+      const setDesc = () => {
+        const f = state.settings.filters[field.key];
+        desc.textContent = isActive(f) ? describeFilter(field, f) : '';
+      };
+      setDesc();
+      const det = h('details', { class: 'fp-item' }, h('summary', {}, h('span', {}, field.label), desc));
+      det.addEventListener('toggle', () => {
+        if (!det.open || det.dataset.built) return;
+        det.dataset.built = '1';
+        det.append(filterEditor({
+          field,
+          records: recordsForFilter(field.key),
+          filter: state.settings.filters[field.key],
+          onChange: (f) => { setFilter(field.key, f); setDesc(); },
+        }));
+      });
+      return det;
+    }));
+  const d = openDialog({
+    title: 'Suodata',
+    wide: true,
+    body,
+    actions: [
+      h('button', { class: 'btn btn-text', onclick: () => { clearFilters(); d.close(); } }, 'Tyhjennä kaikki'),
+      h('span', { class: 'spacer' }),
+      h('button', { class: 'btn btn-primary', onclick: () => d.close() }, 'Valmis'),
+    ],
+  });
+}
+
+function openColumns(anchor) {
+  const draw = () => visibleFields().map((f) => {
+    const shown = !(state.settings.columns[f.key]?.hidden ?? f.table === false);
+    return h('label', { class: 'fx-item' },
+      h('input', {
+        type: 'checkbox', checked: shown,
+        onchange: (e) => {
+          state.settings.columns = { ...state.settings.columns, [f.key]: { ...state.settings.columns[f.key], hidden: !e.target.checked } };
+          saveSettings();
+          render();
+        },
+      }),
+      h('span', { class: 'fx-val' }, f.label));
+  });
+  const list = h('div', { class: 'fx-list cols' }, draw());
+  openPopover(anchor, {
+    title: 'Näytettävät sarakkeet',
+    className: 'filter-pop',
+    body: h('div', { class: 'fx' }, list,
+      h('div', { class: 'fx-foot' },
+        h('button', {
+          type: 'button', class: 'btn btn-small btn-text',
+          onclick: () => {
+            state.settings.columns = Object.fromEntries(Object.entries(state.settings.columns).map(([k, v]) => [k, { width: v.width }]));
+            saveSettings(); render(); list.replaceChildren(...draw());
+          },
+        }, 'Oletukset'),
+        h('button', { type: 'button', class: 'btn btn-small', onclick: openFields }, icon('fields', 16), 'Muokkaa kenttiä…'))),
+  });
 }
 
 // ── Päänäkymä ───────────────────────────────────────────────────────────────
-function visibleRecords() {
-  const { genre, format, grade } = state.filters;
-  return state.records
-    .filter((r) => (!genre || r.genre === genre) && (!format || r.format === format) &&
-      (!grade || r.media_grade === grade) && matchesQuery(r, state.query))
-    .sort(SORTS[state.settings.sort]?.cmp ?? SORTS.artist.cmp);
-}
-
 function placeholderCover(r) {
   const initials = (r.artist || '?').replace(/^the\s+/i, '').slice(0, 2).toUpperCase();
   return h('div', { class: 'cover placeholder', 'aria-hidden': 'true' },
@@ -100,96 +441,131 @@ function coverEl(r, cls = '') {
     : placeholderCover(r);
 }
 
+/** Ensimmäinen värikoodattu valintakenttä, jonka arvo poikkeaa oletuksesta → merkki kortin kulmaan. */
+function badgeFor(r) {
+  for (const f of visibleFields()) {
+    if (f.type === 'select' && f.colors && r[f.key] && r[f.key] !== f.default) {
+      return h('span', { class: 'card-badge', style: f.colors[r[f.key]] ? { '--pill': f.colors[r[f.key]] } : null }, r[f.key]);
+    }
+  }
+  return null;
+}
+
 function card(r) {
-  const meta = [r.year, r.format !== 'LP' ? r.format : '', r.media_grade].filter(Boolean).join(' · ');
+  const F = fields();
+  const meta = [
+    F.has('year') && r.year,
+    F.has('format') && r.format !== F.get('format').default && r.format,
+    F.has('media_grade') && r.media_grade,
+  ].filter(Boolean).join(' · ');
   return h('button', { class: 'card', onclick: () => openDetail(r.id), 'aria-label': `${r.artist}: ${r.title}` },
-    coverEl(r),
+    h('div', { class: 'card-cover' }, coverEl(r), badgeFor(r)),
     h('div', { class: 'card-text' },
       h('div', { class: 'card-title' }, r.title),
       h('div', { class: 'card-artist' }, r.artist),
       meta && h('div', { class: 'card-meta' }, meta)));
 }
 
-function row(r) {
-  return h('button', { class: 'row', onclick: () => openDetail(r.id) },
-    coverEl(r, 'small'),
-    h('div', { class: 'row-main' },
-      h('div', { class: 'row-title' }, r.title),
-      h('div', { class: 'row-artist' }, r.artist)),
-    h('div', { class: 'row-col col-year' }, r.year),
-    h('div', { class: 'row-col col-label' }, [r.label, r.catalog_number].filter(Boolean).join(' · ')),
-    h('div', { class: 'row-col col-genre' }, r.genre),
-    h('div', { class: 'row-col col-loc' }, r.location),
-    h('div', { class: 'row-col col-grade' }, r.media_grade && h('span', { class: 'grade' }, r.media_grade)));
+function renderToolbar() {
+  const sortSel = $('#sort');
+  const primary = state.settings.sort[0];
+  sortSel.replaceChildren(
+    h('option', { value: '' }, 'Oletusjärjestys'),
+    h('optgroup', { label: 'Kentät' }, visibleFields().map((f) => h('option', { value: f.key }, f.label))),
+    h('optgroup', { label: 'Muut' }, SYSTEM_SORT_FIELDS.map((f) => h('option', { value: f.key }, f.label))));
+  sortSel.value = primary?.key ?? '';
+  if (sortSel.value !== (primary?.key ?? '')) sortSel.value = '';
+  const dirBtn = $('#sort-dir');
+  dirBtn.disabled = !primary;
+  dirBtn.replaceChildren(icon(primary?.dir === 'desc' ? 'sortDesc' : 'sortAsc'));
+  dirBtn.setAttribute('aria-label', primary?.dir === 'desc' ? 'Laskeva järjestys – vaihda nousevaksi' : 'Nouseva järjestys – vaihda laskevaksi');
+  dirBtn.title = dirBtn.getAttribute('aria-label');
+
+  const n = activeFilterCount(state.schema, state.settings.filters);
+  $('#filter-toggle').dataset.count = n || '';
+  document.querySelectorAll('[data-view]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.view === state.settings.view)));
+  $('#btn-columns').hidden = state.settings.view !== 'table';
 }
 
-function fillSelect(sel, values, allLabel) {
-  const current = sel.value;
-  sel.replaceChildren(h('option', { value: '' }, allLabel), ...values.map((v) => h('option', { value: v }, v)));
-  sel.value = values.includes(current) ? current : '';
+function renderChips() {
+  const host = $('#chips');
+  const F = fields();
+  const chips = [];
+  for (const [key, f] of Object.entries(state.settings.filters)) {
+    const field = F.get(key);
+    if (!field || !isActive(f)) continue;
+    chips.push(h('span', { class: 'chip-filter' },
+      h('button', { type: 'button', class: 'chip-main', onclick: (e) => openFieldFilter(key, e.currentTarget) },
+        h('strong', {}, field.label), `: ${describeFilter(field, f)}`),
+      h('button', { type: 'button', class: 'chip-x', 'aria-label': `Poista suodatin: ${field.label}`, onclick: () => setFilter(key, undefined) }, icon('close', 14))));
+  }
+  if (state.query) {
+    chips.push(h('span', { class: 'chip-filter' },
+      h('span', { class: 'chip-main' }, h('strong', {}, 'Haku'), `: ”${state.query}”`),
+      h('button', { type: 'button', class: 'chip-x', 'aria-label': 'Tyhjennä haku', onclick: () => { state.query = ''; $('#search').value = ''; state.frozenIds = null; render(); } }, icon('close', 14))));
+  }
+  if (chips.length > 1) chips.push(h('button', { type: 'button', class: 'btn btn-small btn-text', onclick: clearFilters }, 'Tyhjennä kaikki'));
+  if (state.frozenIds) {
+    const fresh = freshView().map((r) => r.id);
+    if (fresh.length !== state.frozenIds.length || fresh.some((id, i) => id !== state.frozenIds[i])) {
+      chips.push(h('button', {
+        type: 'button', class: 'chip-refresh', title: 'Muokatut rivit pysyvät paikallaan, kunnes päivität',
+        onclick: () => { state.frozenIds = null; render(); },
+      }, icon('refresh', 16), 'Päivitä järjestys ja suodatus'));
+    }
+  }
+  host.hidden = !chips.length;
+  host.replaceChildren(...chips);
 }
 
-function uniqueValues(field) {
-  return [...new Set(state.records.map((r) => r[field]).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'fi'));
+/** Yläpalkki, työkalurivi ja suodatinsirut – ei itse kokoelmaa. */
+function renderChrome() {
+  const total = state.records.length;
+  const shown = visibleRecords().length;
+  $('#count').textContent = total ? (shown === total ? `${total} levyä` : `${shown} / ${total} levyä`) : '';
+  renderToolbar();
+  renderChips();
+  renderBanner();
 }
 
 function render() {
+  renderChrome();
   const list = visibleRecords();
   const main = $('#collection');
   const total = state.records.length;
+  const tableMode = state.settings.view === 'table' && total > 0;
+  document.body.classList.toggle('table-mode', tableMode);
 
-  $('#count').textContent = total
-    ? (list.length === total ? `${total} levyä` : `${list.length} / ${total} levyä`)
-    : '';
-
-  fillSelect($('#f-genre'), uniqueValues('genre'), 'Kaikki genret');
-  fillSelect($('#f-format'), FORMATS.filter((f) => state.records.some((r) => r.format === f)), 'Kaikki formaatit');
-  fillSelect($('#f-grade'), GRADES.map((g) => g.code).filter((c) => state.records.some((r) => r.media_grade === c)), 'Kaikki kunnot');
-  for (const k of ['genre', 'format', 'grade']) $(`#f-${k}`).value = state.filters[k];
-  const activeFilters = Object.values(state.filters).filter(Boolean).length;
-  $('#filter-toggle').dataset.count = activeFilters || '';
-
-  document.querySelectorAll('[data-view]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.view === state.settings.view)));
-
-  main.className = state.settings.view === 'list' ? 'list' : 'grid';
   if (!total) {
     main.className = 'empty';
     main.replaceChildren(h('div', { class: 'empty-state' },
       h('div', { class: 'empty-disc' }),
       h('h2', {}, 'Hylly on vielä tyhjä'),
-      h('p', {}, 'Lisää ensimmäinen levy ja ota kannesta kuva – tai tuo olemassa oleva luettelo CSV-tiedostosta (myös Discogsin vienti käy).'),
+      h('p', {}, 'Lisää ensimmäinen levy ja ota kannesta kuva – tai tuo olemassa oleva luettelo CSV-tiedostosta (myös Excel ja Discogsin vienti käyvät).'),
       h('div', { class: 'empty-actions' },
         h('button', { class: 'btn btn-primary', onclick: () => openEditor() }, icon('plus'), 'Lisää levy'),
         h('button', { class: 'btn', onclick: importFile }, icon('upload'), 'Tuo tiedosto'),
         state.settings.backend === 'local' && h('button', { class: 'btn', onclick: () => openSettings('storage') }, icon('cloud'), 'Yhdistä pilveen'))));
-    renderBanner();
     return;
   }
+
+  if (tableMode) {
+    main.className = 'table';
+    state.table ??= createTable();
+    if (state.table.el.parentElement !== main) main.replaceChildren(state.table.el);
+    state.table.update({ records: list, columns: tableColumns(), sort: state.settings.sort, filters: state.settings.filters });
+    return;
+  }
+
+  main.className = 'grid';
   if (!list.length) {
     main.className = 'empty';
     main.replaceChildren(h('div', { class: 'empty-state small' },
-      h('p', {}, 'Haulla ei löytynyt levyjä.'),
+      h('p', {}, 'Haulla ja suodattimilla ei löytynyt levyjä.'),
       h('button', { class: 'btn', onclick: clearFilters }, 'Tyhjennä haku ja suodattimet')));
-    renderBanner();
     return;
   }
-  if (state.settings.view === 'list') {
-    main.replaceChildren(
-      h('div', { class: 'row head', 'aria-hidden': 'true' },
-        h('span', {}), h('span', {}, 'Levy'), h('span', { class: 'col-year' }, 'Vuosi'),
-        h('span', { class: 'col-label' }, 'Yhtiö'), h('span', { class: 'col-genre' }, 'Genre'),
-        h('span', { class: 'col-loc' }, 'Sijainti'), h('span', { class: 'col-grade' }, 'Kunto')),
-      ...list.map(row));
-  } else {
-    main.replaceChildren(...list.map(card));
-  }
-  renderBanner();
-}
-
-function clearFilters() {
-  state.query = ''; $('#search').value = '';
-  state.filters = { genre: '', format: '', grade: '' };
-  render();
+  main.replaceChildren(...list.map(card));
 }
 
 function renderBanner() {
@@ -229,18 +605,38 @@ async function onSyncStatusClick() {
 }
 
 // ── Levyn tiedot ────────────────────────────────────────────────────────────
+function valueNode(f, v) {
+  if (f.type === 'textarea') return h('dd', { class: 'notes-dd' }, v);
+  const dd = h('dd');
+  renderValue(dd, f, v);
+  if (f.type === 'grade') {
+    const g = GRADES.find((x) => x.code === v);
+    if (g) dd.append(` ${g.name}`);
+  }
+  return dd;
+}
+
 async function openDetail(id) {
   const r = state.records.find((x) => x.id === id);
   if (!r) return;
   const cover = await db.getCover(id);
   const fullUrl = cover?.full ? URL.createObjectURL(cover.full) : null;
+  const F = fields();
 
-  const field = (k, v = r[k]) => v ? h('div', { class: 'kv' }, h('dt', {}, LABELS[k]), h('dd', {}, v)) : null;
-  const grade = (k) => {
-    const g = GRADES.find((x) => x.code === r[k]);
-    return g ? h('div', { class: 'kv' }, h('dt', {}, LABELS[k]), h('dd', {}, h('span', { class: 'grade' }, g.code), ` ${g.name}`)) : null;
-  };
-  const fmt = [r.discs > 1 ? `${r.discs} × ` : '', r.format, r.size, r.speed_rpm && `${r.speed_rpm} rpm`].filter(Boolean).join(' ').replace('×  ', '× ');
+  // Kentät ryhmittäin; artisti ja nimi ovat otsikossa
+  const groups = new Map();
+  for (const f of visibleFields()) {
+    const v = r[f.key];
+    if (!v || f.key === 'artist' || f.key === 'title') continue;
+    if (!groups.has(f.group)) groups.set(f.group, []);
+    groups.get(f.group).push(h('div', { class: 'kv' }, h('dt', {}, f.label), valueNode(f, v)));
+  }
+  const extras = Object.entries(r).filter(([k, v]) => v && !SYSTEM_FIELDS.includes(k) && !F.has(k));
+  if (extras.length) {
+    groups.set('Muut sarakkeet', extras.map(([k, v]) => h('div', { class: 'kv' }, h('dt', {}, k), h('dd', {}, v))));
+  }
+
+  const sub = ['year', 'country', 'genre', 'style'].filter((k) => F.has(k) && r[k]).map((k) => formatValue(F.get(k), r[k])).join(' · ');
   const discogsUrl = r.discogs_id
     ? `https://www.discogs.com/release/${encodeURIComponent(r.discogs_id)}`
     : `https://www.discogs.com/search/?${new URLSearchParams({ q: `${r.artist} ${r.title}`, type: 'release' })}`;
@@ -250,18 +646,14 @@ async function openDetail(id) {
     wide: true,
     className: 'detail',
     body: h('div', { class: 'detail-grid' },
-      fullUrl ? h('img', { class: 'detail-cover', src: fullUrl, alt: `Kansikuva: ${r.artist} – ${r.title}` }) : h('div', { class: 'detail-cover' }, placeholderCover(r)),
+      h('div', { class: 'detail-cover-wrap' },
+        fullUrl ? h('img', { class: 'detail-cover', src: fullUrl, alt: `Kansikuva: ${r.artist} – ${r.title}` }) : h('div', { class: 'detail-cover' }, placeholderCover(r)),
+        badgeFor(r)),
       h('div', { class: 'detail-info' },
         h('p', { class: 'detail-artist' }, r.artist),
         h('h3', { class: 'detail-title' }, r.title),
-        h('p', { class: 'detail-sub' }, [r.year, r.country, r.genre, r.style].filter(Boolean).join(' · ')),
-        h('dl', {},
-          field('label'), field('catalog_number'), fmt && h('div', { class: 'kv' }, h('dt', {}, LABELS.format), h('dd', {}, fmt)),
-          grade('media_grade'), grade('sleeve_grade'), field('location'),
-          field('purchase_date', r.purchase_date && new Date(r.purchase_date).toLocaleDateString('fi-FI')),
-          field('purchase_price', r.purchase_price && formatMoney(Number(r.purchase_price))),
-          field('purchase_place'), field('barcode')),
-        r.notes && h('div', { class: 'notes' }, r.notes),
+        sub && h('p', { class: 'detail-sub' }, sub),
+        [...groups].map(([g, rows]) => h('section', { class: 'detail-group' }, h('h4', {}, g), h('dl', {}, rows))),
         h('p', { class: 'detail-links' },
           h('a', { href: discogsUrl, target: '_blank', rel: 'noopener' }, r.discogs_id ? 'Avaa Discogsissa ↗' : 'Etsi Discogsista ↗')),
         h('p', { class: 'stamp' }, `Lisätty ${formatDate(r.created_at)} · muokattu ${formatDate(r.updated_at)}`))),
@@ -275,9 +667,41 @@ async function openDetail(id) {
 }
 
 // ── Lomake ──────────────────────────────────────────────────────────────────
+function fieldInput(f, value) {
+  const common = { name: f.key, id: `f-${f.key}`, 'aria-describedby': `err-${f.key}`, required: f.required };
+  const opts = (list) => list.map(([v, text]) => h('option', { value: v, selected: v === value }, text));
+  switch (f.type) {
+    case 'textarea': { const t = h('textarea', { ...common, rows: 3 }); t.value = value; return t; }
+    case 'select': {
+      const list = f.options.map((o) => [o, o]);
+      if (value && !f.options.includes(value)) list.push([value, value]);
+      return h('select', common, h('option', { value: '' }, '–'), opts(list));
+    }
+    case 'grade': {
+      const list = GRADES.map((g) => [g.code, `${g.code} – ${g.name}: ${g.desc}`]);
+      if (value && !GRADES.some((g) => g.code === value)) list.push([value, value]);
+      return h('select', common, h('option', { value: '' }, '–'), opts(list));
+    }
+    case 'rating':
+      return h('select', common, h('option', { value: '' }, '–'), opts([1, 2, 3, 4, 5].map((n) => [String(n), '★'.repeat(n) + '☆'.repeat(5 - n)])));
+    case 'checkbox':
+      return h('input', { ...common, type: 'checkbox', checked: !!value, class: 'check' });
+    case 'date':
+      return h('input', { ...common, type: 'date', value });
+    case 'number':
+      return h('input', { ...common, type: 'text', inputmode: f.decimals === 0 ? 'numeric' : 'decimal', value: editableText(f, value), placeholder: f.placeholder, autocomplete: 'off' });
+    case 'money':
+      return h('input', { ...common, type: 'text', inputmode: 'decimal', value: editableText(f, value), placeholder: f.placeholder || '0,00', autocomplete: 'off' });
+    case 'url':
+      return h('input', { ...common, type: 'url', inputmode: 'url', value, placeholder: f.placeholder || 'https://', autocomplete: 'off' });
+    default:
+      return h('input', { ...common, type: 'text', value, list: `dl-${f.key}`, placeholder: f.placeholder, autocomplete: 'off', autocapitalize: 'sentences', enterkeyhint: 'next' });
+  }
+}
+
 async function openEditor(id = null) {
   const existing = id ? state.records.find((r) => r.id === id) : null;
-  const rec = existing ? { ...existing } : emptyRecord();
+  const rec = existing ? { ...existing } : emptyRecord(state.schema);
   const cover = { action: 'none', blob: null };
   const oldCover = existing ? await db.getCover(existing.id) : null;
   let previewUrl = oldCover?.thumb ? URL.createObjectURL(oldCover.thumb) : null;
@@ -292,7 +716,7 @@ async function openEditor(id = null) {
     coverActions.replaceChildren(
       h('button', { type: 'button', class: 'btn btn-primary', onclick: () => chooseImage('environment') }, icon('camera'), 'Ota kuva'),
       h('button', { type: 'button', class: 'btn', onclick: () => chooseImage() }, icon('image'), 'Galleriasta'),
-      previewUrl && h('button', { type: 'button', class: 'btn btn-danger-text', onclick: removeImage }, icon('trash'), 'Poista kuva'),
+      previewUrl ? h('button', { type: 'button', class: 'btn btn-danger-text', onclick: removeImage }, icon('trash'), 'Poista kuva') : '',
     );
   }
 
@@ -318,64 +742,30 @@ async function openEditor(id = null) {
   }
   renderCover();
 
-  // Raahaa ja pudota / liitä leikepöydältä (läppäri)
   preview.addEventListener('dragover', (e) => { e.preventDefault(); preview.classList.add('drop'); });
   preview.addEventListener('dragleave', () => preview.classList.remove('drop'));
   preview.addEventListener('drop', (e) => { e.preventDefault(); preview.classList.remove('drop'); useImage(e.dataTransfer.files[0]); });
 
-  const datalist = (fid, values) => h('datalist', { id: fid }, values.map((v) => h('option', { value: v })));
-  const input = (k, opts = {}) => h('label', { class: `field ${opts.wide ? 'wide' : ''} ${opts.req ? 'req' : ''}` },
-    h('span', {}, LABELS[k]),
-    h('input', {
-      name: k, value: rec[k] ?? '', type: opts.type || 'text', inputmode: opts.inputmode, list: opts.list,
-      autocomplete: 'off', autocapitalize: opts.caps ?? 'words', enterkeyhint: 'next', placeholder: opts.ph,
-      required: opts.req, step: opts.step, min: opts.min, max: opts.max,
-    }),
-    h('small', { class: 'err', id: `err-${k}` }));
-  const select = (k, options, opts = {}) => h('label', { class: `field ${opts.wide ? 'wide' : ''}` },
-    h('span', {}, LABELS[k]),
-    h('select', { name: k },
-      opts.empty !== false && h('option', { value: '' }, '–'),
-      options.map((o) => h('option', { value: o.value ?? o, selected: (o.value ?? o) === rec[k] }, o.label ?? o))),
-    h('small', { class: 'err', id: `err-${k}` }));
-  const gradeOptions = GRADES.map((g) => ({ value: g.code, label: `${g.code} – ${g.name}: ${g.desc}` }));
+  // Kentät ryhmittäin määrittelyn järjestyksessä
+  const groups = new Map();
+  for (const f of visibleFields()) {
+    if (!groups.has(f.group)) groups.set(f.group, []);
+    const wide = f.type === 'textarea' || f.key === 'artist' || f.key === 'title' || f.type === 'grade';
+    groups.get(f.group).push(h('label', { class: `field t-${f.type}${wide ? ' wide' : ''}${f.required ? ' req' : ''}` },
+      h('span', {}, f.label),
+      fieldInput(f, rec[f.key] ?? ''),
+      f.help && h('small', { class: 'help' }, f.help),
+      h('small', { class: 'err', id: `err-${f.key}` })));
+  }
+  const datalists = visibleFields().filter((f) => f.type === 'text')
+    .map((f) => h('datalist', { id: `dl-${f.key}` }, uniqueValues(f.key).slice(0, 300).map((v) => h('option', { value: v }))));
 
-  const form = h('form', { class: 'editor', novalidate: true, autocomplete: 'off' },
+  const form = h('form', { class: 'editor', novalidate: true, autocomplete: 'off', id: 'editor-form' },
     h('section', { class: 'cover-edit' }, preview, coverActions,
       h('p', { class: 'hint desktop-only' }, 'Voit myös raahata kuvan tähän tai liittää sen leikepöydältä (Ctrl+V).')),
-    h('fieldset', {}, h('legend', {}, 'Perustiedot'),
-      input('artist', { req: true, list: 'dl-artist', wide: true }),
-      input('title', { req: true, wide: true, caps: 'sentences' }),
-      input('year', { type: 'number', inputmode: 'numeric', min: 1890, max: new Date().getFullYear() + 1, ph: 'esim. 1973' }),
-      input('label', { list: 'dl-label' }),
-      input('catalog_number', { caps: 'characters' }),
-      input('country', { list: 'dl-country' })),
-    h('fieldset', {}, h('legend', {}, 'Formaatti'),
-      select('format', FORMATS, { empty: false }),
-      select('size', SIZES),
-      select('speed_rpm', SPEEDS.map((s) => ({ value: s, label: `${s} rpm` }))),
-      input('discs', { type: 'number', inputmode: 'numeric', min: 1 })),
-    h('fieldset', {}, h('legend', {}, 'Genre'),
-      input('genre', { list: 'dl-genre' }),
-      input('style', { list: 'dl-style' })),
-    h('fieldset', {}, h('legend', {}, 'Kunto (Goldmine)'),
-      select('media_grade', gradeOptions, { wide: true }),
-      select('sleeve_grade', gradeOptions, { wide: true })),
-    h('fieldset', {}, h('legend', {}, 'Hankinta ja sijainti'),
-      input('location', { list: 'dl-location', ph: 'esim. Hylly 2 / B' }),
-      input('purchase_date', { type: 'date' }),
-      input('purchase_price', { inputmode: 'decimal', ph: '0,00', caps: 'none' }),
-      input('purchase_place', { list: 'dl-place' })),
-    h('fieldset', {}, h('legend', {}, 'Muut'),
-      input('barcode', { inputmode: 'numeric', caps: 'none' }),
-      input('discogs_id', { inputmode: 'numeric', caps: 'none' }),
-      h('label', { class: 'field wide' }, h('span', {}, LABELS.notes),
-        h('textarea', { name: 'notes', rows: 3 }, rec.notes || ''))),
-    datalist('dl-artist', uniqueValues('artist')), datalist('dl-label', uniqueValues('label')),
-    datalist('dl-country', uniqueValues('country')), datalist('dl-genre', uniqueValues('genre')),
-    datalist('dl-style', uniqueValues('style')), datalist('dl-location', uniqueValues('location')),
-    datalist('dl-place', uniqueValues('purchase_place')));
-  form.querySelector('[name="purchase_price"]').value = rec.purchase_price ? rec.purchase_price.replace('.', ',') : '';
+    h('div', { class: 'editor-fields' },
+      [...groups].map(([g, items]) => h('fieldset', {}, h('legend', {}, g), items))),
+    datalists);
 
   const onPaste = (e) => {
     const file = [...(e.clipboardData?.files || [])].find((f) => f.type.startsWith('image/'));
@@ -384,21 +774,25 @@ async function openEditor(id = null) {
   document.addEventListener('paste', onPaste);
 
   const saveBtn = h('button', { class: 'btn btn-primary', type: 'submit', form: 'editor-form' }, icon('check'), 'Tallenna');
-  form.id = 'editor-form';
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const data = Object.fromEntries(new FormData(form));
-    const next = normalizeRecord({ ...rec, ...data });
+    const data = {};
+    for (const f of visibleFields()) {
+      const el = form.elements[f.key];
+      if (el) data[f.key] = f.type === 'checkbox' ? (el.checked ? CHECKED : '') : el.value;
+    }
+    const next = normalizeRecord(state.schema, { ...rec, ...data });
     next.id = rec.id || newId();
     next.created_at = rec.created_at || nowIso();
-    next.cover_file = rec.cover_file;
-    const errors = validateRecord(next);
+    next.cover_file = rec.cover_file || '';
+    const errors = validateRecord(state.schema, next);
     form.querySelectorAll('.err').forEach((el) => { el.textContent = ''; });
     form.querySelectorAll('[aria-invalid]').forEach((el) => el.removeAttribute('aria-invalid'));
     if (Object.keys(errors).length) {
       for (const [k, msg] of Object.entries(errors)) {
-        const el = form.querySelector(`#err-${k}`); if (el) el.textContent = msg;
-        form.querySelector(`[name="${k}"]`)?.setAttribute('aria-invalid', 'true');
+        const el = form.querySelector(`#err-${k}`);
+        if (el) el.textContent = msg;
+        form.elements[k]?.setAttribute('aria-invalid', 'true');
       }
       form.querySelector('[aria-invalid]')?.focus();
       return;
@@ -425,7 +819,7 @@ async function openEditor(id = null) {
     actions: [h('button', { class: 'btn', type: 'button', onclick: () => d.close() }, 'Peruuta'), saveBtn],
     onClose: () => { document.removeEventListener('paste', onPaste); if (previewUrl) URL.revokeObjectURL(previewUrl); },
   });
-  if (!existing && !matchMedia('(pointer: coarse)').matches) form.querySelector('[name="artist"]').focus();
+  if (!existing && !matchMedia('(pointer: coarse)').matches) form.elements.artist?.focus();
 }
 
 async function persistRecord(rec, cover, existing) {
@@ -447,6 +841,7 @@ async function persistRecord(rec, cover, existing) {
   await db.putRecords([rec]);
   const i = state.records.findIndex((r) => r.id === rec.id);
   if (i >= 0) state.records[i] = rec; else state.records.push(rec);
+  if (state.frozenIds && !state.frozenIds.includes(rec.id)) state.frozenIds = null;
   render();
   scheduleSync();
 }
@@ -483,9 +878,7 @@ async function deleteRecord(id) {
 }
 
 // ── Tuonti ja vienti ────────────────────────────────────────────────────────
-function today() {
-  return new Date().toISOString().slice(0, 10);
-}
+const today = () => new Date().toISOString().slice(0, 10);
 
 async function exportData(kind) {
   try {
@@ -493,19 +886,31 @@ async function exportData(kind) {
       const enc = new TextEncoder();
       const covers = await db.allCovers();
       const used = new Set(state.records.map((r) => r.cover_file));
-      const files = [{ name: CSV_NAME, data: enc.encode(recordsToCSV(state.records)) }];
+      const files = [
+        { name: CSV_NAME, data: enc.encode(recordsToCSV(state.records, state.schema)) },
+        { name: SCHEMA_FILE, data: enc.encode(schemaToJSON(state.schema)) },
+      ];
       for (const c of covers) {
         if (c.full && used.has(c.file)) files.push({ name: c.file, data: new Uint8Array(await c.full.arrayBuffer()) });
       }
       await saveFile(new Blob([createZip(files)], { type: 'application/zip' }), `lp-kokoelma-${today()}.zip`);
       await saveSettings({ lastExportAt: nowIso() });
       renderBanner();
-    } else {
-      const delimiter = kind === 'csv-excel' ? ';' : ',';
-      const sorted = [...state.records].sort(SORTS.artist.cmp);
-      const csv = toCSV(FIELDS, sorted, { delimiter });
-      await saveFile(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `lp-kokoelma-${today()}.csv`);
+      return;
     }
+    const view = kind === 'csv-view';
+    const records = view ? visibleRecords() : sortRecords(state.records, state.schema, []);
+    if (kind === 'csv') {
+      await saveFile(new Blob([recordsToCSV(records, state.schema)], { type: 'text/csv;charset=utf-8' }), `lp-kokoelma-${today()}.csv`);
+      return;
+    }
+    // Excel: puolipiste-erotin, desimaalipilkku ja kenttien näkyvät nimet otsikoina
+    const F = fields();
+    const cols = view ? tableColumns().map((c) => c.field.key) : csvColumns(state.schema, records);
+    const headers = cols.map((k) => F.get(k)?.label ?? k);
+    const rows = records.map((r) => Object.fromEntries(cols.map((k, i) => [headers[i], F.has(k) ? editableText(F.get(k), r[k] ?? '') : r[k] ?? ''])));
+    const csv = toCSV(headers, rows, { delimiter: ';' });
+    await saveFile(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `lp-kokoelma-${view ? 'nakyma-' : ''}${today()}.csv`);
   } catch (e) {
     console.error(e);
     toast(`Vienti epäonnistui: ${e.message}`, { kind: 'error' });
@@ -513,52 +918,104 @@ async function exportData(kind) {
 }
 
 async function openExport() {
+  const n = visibleRecords().length;
   const kind = await choiceDialog('Valitse muoto:', [
-    { value: 'zip', label: 'Varmuuskopio (ZIP)', desc: 'CSV + kaikki kansikuvat. Tällä voi palauttaa koko kokoelman.' },
-    { value: 'csv-excel', label: 'CSV Exceliin', desc: 'Puolipiste-erotin, aukeaa suoraan suomenkielisessä Excelissä.' },
-    { value: 'csv', label: 'CSV (standardi)', desc: 'Pilkkuerotin – Google Sheets, Numbers, muut ohjelmat.' },
-  ], { title: 'Vie kokoelma' });
+    { value: 'zip', label: 'Varmuuskopio (ZIP)', desc: 'CSV, kentät ja kaikki kansikuvat. Tällä voi palauttaa koko kokoelman.' },
+    { value: 'csv-excel', label: 'Excel (CSV)', desc: 'Puolipiste-erotin ja suomenkieliset sarakenimet – aukeaa suoraan Excelissä.' },
+    n !== state.records.length || state.settings.view === 'table'
+      ? { value: 'csv-view', label: `Nykyinen näkymä Exceliin (${n} riviä)`, desc: 'Vain suodatetut rivit ja näkyvät sarakkeet nykyisessä järjestyksessä.' }
+      : null,
+    { value: 'csv', label: 'CSV (standardi)', desc: 'Sama muoto kuin kokoelma.csv – Google Sheets, Numbers, muut ohjelmat.' },
+  ].filter(Boolean), { title: 'Vie kokoelma' });
   if (kind) exportData(kind);
+}
+
+function importDialog({ total, imgCount, fresh, updates, dupes, newFields }) {
+  return new Promise((resolve) => {
+    let result = null;
+    let mode = 'merge';
+    const radio = (value, title, desc, danger = false) => h('label', { class: `choice radio${danger ? ' danger' : ''}` },
+      h('input', { type: 'radio', name: 'import-mode', value, checked: value === mode, onchange: () => { mode = value; } }),
+      h('span', {}, h('strong', {}, title), h('span', {}, desc)));
+    const addNew = h('input', { type: 'checkbox', checked: true });
+    const d = openDialog({
+      title: 'Tuo levyt',
+      className: 'small',
+      body: h('div', { class: 'import-dlg' },
+        h('p', { class: 'confirm-text' }, `Tiedostossa on ${total} levyä${imgCount ? ` ja ${imgCount} kansikuvaa` : ''}.`),
+        h('div', { class: 'choice-list' },
+          radio('merge', 'Yhdistä kokoelmaan', `${fresh} uutta, ${updates} päivitettyä${dupes ? `, ${dupes} tuplaa ohitetaan` : ''}.`),
+          radio('replace', 'Korvaa koko kokoelma', `Nykyiset ${state.records.length} levyä poistetaan.`, true)),
+        newFields.length ? h('label', { class: 'fe-flag import-new' }, addNew,
+          h('span', {}, `Lisää tuntemattomat sarakkeet uusiksi kentiksi: ${newFields.map((f) => f.label).join(', ')}`)) : ''),
+      actions: [
+        h('button', { class: 'btn', onclick: () => d.close() }, 'Peruuta'),
+        h('button', { class: 'btn btn-primary', onclick: () => { result = { mode, addNew: newFields.length > 0 && addNew.checked }; d.close(); } }, 'Tuo'),
+      ],
+      onClose: () => resolve(result),
+    });
+  });
 }
 
 async function importFile() {
   const file = await pickFile('.csv,.zip,.txt,text/csv,application/zip');
   if (!file) return;
   try {
-    let csvText; let images = new Map();
+    let csvText;
+    let images = new Map();
+    let zipSchema = null;
     if (/\.zip$/i.test(file.name) || file.type.includes('zip')) {
       const entries = await readZip(new Uint8Array(await file.arrayBuffer()));
       const csvName = entries.has(CSV_NAME) ? CSV_NAME : [...entries.keys()].find((n) => /\.csv$/i.test(n));
       if (!csvName) throw new Error('ZIP-paketista ei löytynyt CSV-tiedostoa');
       csvText = new TextDecoder().decode(entries.get(csvName));
+      if (entries.has(SCHEMA_FILE)) {
+        try { zipSchema = parseSchema(new TextDecoder().decode(entries.get(SCHEMA_FILE))).schema; } catch { /* ohitetaan */ }
+      }
       images = entries;
     } else {
       csvText = await file.text();
     }
-    const { records: rows } = parseCSVObjects(csvText);
-    const incoming = rows.map(fromImportRow).filter(Boolean);
-    if (!incoming.length) throw new Error('Tiedostosta ei löytynyt levyjä. Tarvitaan vähintään sarakkeet artist/artisti ja title/nimi.');
+    const { headers, records: rows } = parseCSVObjects(csvText);
 
-    const byId = new Map(state.records.map((r) => [r.id, r]));
-    const keys = new Set(state.records.map(duplicateKey));
-    const fresh = incoming.filter((r) => !byId.has(r.id) && !keys.has(duplicateKey(r)));
-    const updates = incoming.filter((r) => byId.has(r.id) && r.updated_at > byId.get(r.id).updated_at);
-    const dupes = incoming.filter((r) => !byId.has(r.id) && keys.has(duplicateKey(r)));
-    const imgCount = incoming.filter((r) => r.cover_file && images.has(r.cover_file)).length;
+    // Uudet kentät: varmuuskopion kentat.json ja tuntemattomat sarakkeet
+    const headerSet = new Set(headers.map((x) => x.trim()));
+    const zipExtra = zipSchema ? mergeSchemas(state.schema, zipSchema).added.filter((f) => headerSet.has(f.key)) : [];
+    const withZip = { ...state.schema, fields: [...state.schema.fields, ...zipExtra] };
+    const newFields = [...zipExtra, ...fieldsForHeaders(withZip, mapHeaders(withZip, headers).unknown)];
+    const extended = { ...state.schema, fields: [...state.schema.fields, ...newFields] };
 
-    const mode = await choiceDialog(
-      `Tiedostossa ${incoming.length} levyä${imgCount ? ` ja ${imgCount} kansikuvaa` : ''}.`,
-      [
-        { value: 'merge', label: 'Yhdistä kokoelmaan', desc: `${fresh.length} uutta, ${updates.length} päivitettyä${dupes.length ? `, ${dupes.length} tuplaa ohitetaan` : ''}.` },
-        { value: 'replace', label: 'Korvaa koko kokoelma', desc: `Nykyiset ${state.records.length} levyä poistetaan.`, danger: true },
-      ],
-      { title: 'Tuo levyt' });
-    if (!mode) return;
-    if (mode === 'replace' && state.records.length &&
+    const parse = (schema) => {
+      const { mapping } = mapHeaders(schema, headers);
+      return rows.map((row) => fromImportRow(schema, row, mapping)).filter(Boolean);
+    };
+    const classify = (incoming) => {
+      const byId = new Map(state.records.map((r) => [r.id, r]));
+      const keys = new Set(state.records.map(duplicateKey));
+      return {
+        fresh: incoming.filter((r) => !byId.has(r.id) && !keys.has(duplicateKey(r))),
+        updates: incoming.filter((r) => byId.has(r.id) && r.updated_at > byId.get(r.id).updated_at),
+        dupes: incoming.filter((r) => !byId.has(r.id) && keys.has(duplicateKey(r))),
+      };
+    };
+
+    const preview = parse(extended);
+    if (!preview.length) throw new Error('Tiedostosta ei löytynyt levyjä. Tarvitaan vähintään sarakkeet artisti ja levyn nimi (tai artist ja title).');
+    const pc = classify(preview);
+    const choice = await importDialog({
+      total: preview.length,
+      imgCount: preview.filter((r) => r.cover_file && images.has(r.cover_file)).length,
+      fresh: pc.fresh.length, updates: pc.updates.length, dupes: pc.dupes.length, newFields,
+    });
+    if (!choice) return;
+    if (choice.mode === 'replace' && state.records.length &&
       !(await confirmDialog(`Poistetaanko nykyiset ${state.records.length} levyä ja korvataan ne tuoduilla?`, { title: 'Korvaa kokoelma', ok: 'Korvaa', danger: true }))) return;
 
-    const toWrite = mode === 'replace' ? incoming : [...fresh, ...updates];
-    if (mode === 'replace') {
+    if (choice.addNew) await applySchema({ ...extended, updated_at: nowIso() }, { sync: false });
+    const incoming = parse(choice.addNew ? extended : state.schema);
+    const c = classify(incoming);
+    const toWrite = choice.mode === 'replace' ? incoming : [...c.fresh, ...c.updates];
+    if (choice.mode === 'replace') {
       const keep = new Set(incoming.map((r) => r.id));
       const removed = state.records.filter((r) => !keep.has(r.id));
       for (const r of removed) if (r.cover_file) await sync.queueRemoteDelete(r.cover_file);
@@ -574,9 +1031,10 @@ async function importFile() {
     }
     await db.putRecords(toWrite);
     await loadAll();
+    state.frozenIds = null;
     render();
     scheduleSync();
-    toast(`Tuotu ${toWrite.length} levyä`);
+    toast(`Tuotu ${toWrite.length} levyä${choice.addNew ? ` ja ${newFields.length} uutta kenttää` : ''}`);
   } catch (e) {
     console.error(e);
     toast(`Tuonti epäonnistui: ${e.message}`, { kind: 'error', timeout: 8000 });
@@ -585,27 +1043,27 @@ async function importFile() {
 
 // ── Tilastot ────────────────────────────────────────────────────────────────
 function openStats() {
-  const s = computeStats(state.records);
+  const recs = visibleRecords();
+  const s = computeStats(state.schema, recs);
+  const filtered = recs.length !== state.records.length;
   const tile = (label, value) => h('div', { class: 'tile' }, h('div', { class: 'tile-value' }, value), h('div', { class: 'tile-label' }, label));
-  const bars = (title, entries, limit = 10) => {
-    if (!entries.length) return null;
+  const bars = ({ label, entries, all }) => {
     const max = Math.max(...entries.map((e) => e[1]));
-    return h('section', { class: 'bars' }, h('h3', {}, title),
-      entries.slice(0, limit).map(([k, v]) => h('div', { class: 'bar-row' },
+    return h('section', { class: 'bars' }, h('h3', {}, label),
+      entries.slice(0, all ? 30 : 12).map(([k, v]) => h('div', { class: 'bar-row' },
         h('span', { class: 'bar-label' }, k),
         h('span', { class: 'bar-track' }, h('span', { class: 'bar', style: { width: `${(v / max) * 100}%` } })),
         h('span', { class: 'bar-value' }, v))));
   };
   openDialog({
-    title: 'Tilastot',
+    title: filtered ? `Tilastot – ${recs.length} suodatettua levyä` : 'Tilastot',
     wide: true,
     body: h('div', { class: 'stats' },
       h('div', { class: 'tiles' },
         tile('levyä', s.total), tile('vinyyliä', s.discs), tile('artistia', s.artists),
-        tile('ostohinnat yht.', formatMoney(s.value)), tile('kansikuvaa', `${s.withCover}/${s.total}`)),
-      h('div', { class: 'bars-grid' },
-        bars('Genret', s.byGenre), bars('Vuosikymmenet', s.byDecade, 20),
-        bars('Formaatit', s.byFormat), bars('Levyjen kunto', s.byGrade))),
+        s.money.map((m) => tile(`${m.label.toLowerCase()} yhteensä`, formatMoney(m.value))),
+        tile('kansikuvaa', `${s.withCover}/${s.total}`)),
+      h('div', { class: 'bars-grid' }, s.distributions.map(bars))),
   });
 }
 
@@ -660,14 +1118,14 @@ function openThemes() {
 // ── Asetukset ───────────────────────────────────────────────────────────────
 async function changeBackend(id) {
   const s = state.settings;
-  if (id === s.backend) return;
+  if (id === s.backend) return false;
   const target = getBackend(id, s);
-  if (id === 'dropbox' && !s.dropboxAppKey) return toast('Anna ensin Dropboxin App key', { kind: 'error' });
-  if (id === 'gdrive' && !s.googleClientId) return toast('Anna ensin Googlen Client ID', { kind: 'error' });
+  if (id === 'dropbox' && !s.dropboxAppKey) { toast('Anna ensin Dropboxin App key', { kind: 'error' }); return false; }
+  if (id === 'gdrive' && !s.googleClientId) { toast('Anna ensin Googlen Client ID', { kind: 'error' }); return false; }
   const covers = state.thumbs.size;
   const msg = id === 'local'
     ? 'Kokoelma jää tälle laitteelle, mutta sitä ei enää synkronoida pilveen.'
-    : `Kokoelma (${state.records.length} levyä, ${covers} kansikuvaa) kopioidaan paikkaan ${target.label}. Jos siellä on jo kokoelma, ne yhdistetään. Tämä laite pitää aina oman kopion, joten sovellus toimii myös ilman verkkoa.`;
+    : `Kokoelma (${state.records.length} levyä, ${covers} kansikuvaa) ja kenttämäärittely kopioidaan paikkaan ${target.label}. Jos siellä on jo kokoelma, ne yhdistetään. Tämä laite pitää aina oman kopion, joten sovellus toimii myös ilman verkkoa.`;
   if (!(await confirmDialog(msg, { title: `Vaihda: ${target.label}`, ok: 'Vaihda' }))) return false;
   try {
     // Dropbox siirtää sivun kirjautumiseen; valinta viimeistellään paluun jälkeen (init)
@@ -698,7 +1156,7 @@ function openSettings(focus) {
     body.replaceChildren(
       h('section', { id: 'set-storage' },
         h('h3', {}, 'Tallennuspaikka'),
-        h('p', { class: 'hint' }, 'Kokoelma tallennetaan tiedostoon kokoelma.csv ja kansikuvat kansioon kannet/. Pilvessä sama kokoelma näkyy kaikilla laitteilla.'),
+        h('p', { class: 'hint' }, 'Levyt tallennetaan tiedostoon kokoelma.csv, kentät tiedostoon kentat.json ja kansikuvat kansioon kannet/. Pilvessä sama kokoelma näkyy kaikilla laitteilla.'),
         h('div', { class: 'backend-list', role: 'radiogroup' },
           BACKENDS.filter((b) => b.supported()).map((b) => h('button', {
             type: 'button', role: 'radio', class: 'backend', 'aria-checked': String(s.backend === b.id),
@@ -709,12 +1167,21 @@ function openSettings(focus) {
           s.backend !== 'local' && h('span', { class: 'spacer' }),
           s.backend !== 'local' && h('button', { class: 'btn btn-small', onclick: async () => { await afterSync(await sync.sync({ interactive: true })); draw(); } }, icon('sync', 16), 'Synkronoi nyt'),
           s.backend !== 'local' && h('button', { class: 'btn btn-small btn-text', onclick: async () => { await backend.disconnect(); sync.emit({ state: 'login' }); draw(); } }, 'Kirjaudu ulos')),
-        h('details', { class: 'advanced', open: s.backend === 'dropbox' || s.backend === 'gdrive' || !!focus },
+        h('details', { class: 'advanced', open: s.backend === 'dropbox' || s.backend === 'gdrive' || focus === 'storage' },
           h('summary', {}, 'Pilvipalveluiden avaimet'),
           keyField('dropboxAppKey', 'Dropbox App key', 'esim. a1b2c3d4e5f6g7h', 'dropbox.com/developers/apps → Create app → App folder. Ohje README:ssä.'),
           keyField('googleClientId', 'Google OAuth Client ID', '…apps.googleusercontent.com', 'console.cloud.google.com → Credentials → OAuth client ID (Web). Ohje README:ssä.'),
           keyField('remoteFolder', 'Kansion nimi pilvessä', 'LP-kokoelma'),
           h('p', { class: 'hint' }, `Paluuosoite, joka rekisteröidään palveluun: ${location.origin}${location.pathname}`))),
+      h('section', { id: 'set-fields' },
+        h('h3', {}, 'Kentät'),
+        h('p', { class: 'hint' }, `${state.schema.fields.length} kenttää (${state.schema.fields.filter((f) => f.hidden).length} piilotettu). Määrittely: ${SCHEMA_FILE} – ${schemaLocationText()}. Tiedostoa voi muokata myös tekstieditorilla; muutos tulee käyttöön seuraavassa synkronoinnissa ilman sovelluspäivitystä.`),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn', onclick: openFields }, icon('fields'), 'Muokkaa kenttiä'),
+          h('button', { class: 'btn', onclick: exportSchema }, icon('download'), `Lataa ${SCHEMA_FILE}`),
+          h('button', { class: 'btn', onclick: importSchema }, icon('upload'), `Tuo ${SCHEMA_FILE}`)),
+        state.schemaWarnings.length ? h('div', { class: 'warnings' }, h('strong', {}, 'Huomautuksia kenttämäärittelystä:'),
+          h('ul', {}, state.schemaWarnings.map((w) => h('li', {}, w)))) : ''),
       h('section', {}, h('h3', {}, 'Teema'), themePicker()),
       h('section', {},
         h('h3', {}, 'Tiedot'),
@@ -724,7 +1191,7 @@ function openSettings(focus) {
         h('p', { class: 'hint', id: 'storage-usage' }, s.lastExportAt ? `Viimeisin varmuuskopio ${formatDate(s.lastExportAt)}.` : 'Varmuuskopiota ei ole vielä otettu.'),
         h('button', { class: 'btn btn-danger-text', onclick: wipeAll }, icon('trash'), 'Tyhjennä tämän laitteen tiedot')),
       h('section', { class: 'about' },
-        h('p', {}, `LP-kokoelma ${VERSION} · Tiedot pysyvät omissa tiedostoissasi – sovellus ei lähetä niitä minnekään muualle.`)));
+        h('p', {}, `Levyhylly ${VERSION} · Tiedot pysyvät omissa tiedostoissasi – sovellus ei lähetä niitä minnekään muualle.`)));
 
     navigator.storage?.estimate?.().then(({ usage }) => {
       const el = body.querySelector('#storage-usage');
@@ -732,8 +1199,9 @@ function openSettings(focus) {
     });
   };
   draw();
-  const off = (() => { const prev = sync.onStatus; sync.onStatus = (st) => { prev(st); if (body.isConnected) draw(); }; return () => { sync.onStatus = prev; }; })();
-  openDialog({ title: 'Asetukset', wide: true, body, onClose: off });
+  const prev = sync.onStatus;
+  sync.onStatus = (st) => { prev(st); if (body.isConnected) draw(); };
+  openDialog({ title: 'Asetukset', wide: true, body, onClose: () => { sync.onStatus = prev; } });
   if (focus) requestAnimationFrame(() => body.querySelector(`#set-${focus}`)?.scrollIntoView({ block: 'start' }));
 }
 
@@ -749,19 +1217,26 @@ async function wipeAll() {
 // ── Käynnistys ─────────────────────────────────────────────────────────────
 function bindChrome() {
   const search = $('#search');
-  search.addEventListener('input', debounce(() => { state.query = search.value; render(); }, 120));
-  $('#sort').append(...Object.entries(SORTS).map(([k, v]) => h('option', { value: k }, v.label)));
-  $('#sort').value = state.settings.sort;
-  $('#sort').addEventListener('change', async (e) => { await saveSettings({ sort: e.target.value }); render(); });
-  for (const k of ['genre', 'format', 'grade']) {
-    $(`#f-${k}`).addEventListener('change', (e) => { state.filters[k] = e.target.value; render(); });
-  }
-  $('#filter-toggle').addEventListener('click', () => {
-    const bar = $('#filters');
-    bar.hidden = !bar.hidden;
-    $('#filter-toggle').setAttribute('aria-expanded', String(!bar.hidden));
+  search.addEventListener('input', debounce(() => { state.query = search.value.trim(); state.frozenIds = null; render(); }, 150));
+  $('#sort').addEventListener('change', (e) => {
+    const key = e.target.value;
+    const dir = key === 'created_at' || key === 'updated_at' ? 'desc' : 'asc';
+    setSort(key ? [{ key, dir }] : []);
   });
-  document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', async () => { await saveSettings({ view: b.dataset.view }); render(); }));
+  $('#sort-dir').addEventListener('click', () => {
+    const [first, ...rest] = state.settings.sort;
+    if (first) setSort([{ ...first, dir: first.dir === 'asc' ? 'desc' : 'asc' }, ...rest]);
+  });
+  $('#filter-toggle').addEventListener('click', openFilterPanel);
+  $('#btn-columns').addEventListener('click', (e) => openColumns(e.currentTarget));
+  document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', async () => {
+    if (state.settings.view === b.dataset.view) return;
+    state.frozenIds = null;
+    await saveSettings({ view: b.dataset.view });
+    window.scrollTo(0, 0);
+    render();
+    if (b.dataset.view === 'table') state.table?.el.focus({ preventScroll: true });
+  }));
   $('#add').addEventListener('click', () => openEditor());
   $('#fab').addEventListener('click', () => openEditor());
   $('#btn-stats').addEventListener('click', openStats);
@@ -771,11 +1246,19 @@ function bindChrome() {
 
   // Pikanäppäimet läppärillä
   document.addEventListener('keydown', (e) => {
-    if (document.querySelector('dialog[open]') || e.ctrlKey || e.metaKey || e.altKey) return;
-    if (/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName)) {
+    if (document.querySelector('dialog[open], .popover')) return;
+    const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName);
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z' && !inField) {
+      e.preventDefault();
+      undoLast();
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (inField) {
       if (e.key === 'Escape' && document.activeElement === search) { search.value = ''; state.query = ''; render(); search.blur(); }
       return;
     }
+    if (document.activeElement === state.table?.el) return; // taulukko käsittelee omat näppäimensä
     if (e.key === '/') { e.preventDefault(); search.focus(); }
     if (e.key === 'n' || e.key === '+') { e.preventDefault(); openEditor(); }
   });
@@ -789,12 +1272,15 @@ function bindChrome() {
 
 async function init() {
   const saved = await db.getMeta('settings', {});
-  state.settings = { ...DEFAULT_SETTINGS, ...saved, customTheme: { ...DEFAULT_SETTINGS.customTheme, ...saved.customTheme } };
-  // Julkaisun config.js täyttää tyhjät avaimet
+  state.settings = migrateSettings({
+    ...structuredClone(DEFAULT_SETTINGS), ...saved,
+    customTheme: { ...DEFAULT_SETTINGS.customTheme, ...saved.customTheme },
+  });
   for (const k of ['dropboxAppKey', 'googleClientId']) if (!state.settings[k] && CONFIG[k]) state.settings[k] = CONFIG[k];
   refreshTheme();
   bindChrome();
 
+  await loadSchema();
   await loadAll();
   render();
   document.body.classList.add('ready');

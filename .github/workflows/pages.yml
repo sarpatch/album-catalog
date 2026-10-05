@@ -37,7 +37,7 @@ jobs:
       - name: Kokoa julkaistavat tiedostot
         run: |
           mkdir _site
-          cp -r index.html manifest.webmanifest sw.js css js icons examples _site/
+          cp -r index.html manifest.webmanifest sw.js kentat.json css js icons examples _site/
           touch _site/.nojekyll
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

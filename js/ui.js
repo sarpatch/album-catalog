@@ -44,6 +44,16 @@ const PATHS = {
   back: 'M15 5l-7 7 7 7',
   disc: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 9.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z',
   login: 'M15 4h4v16h-4M10 8l4 4-4 4M14 12H3',
+  filter: 'M3 5h18l-7 8v6l-4-2v-4z',
+  columns: 'M4 4h16v16H4zM9.5 4v16M14.5 4v16',
+  table: 'M3 5h18v14H3zM3 10h18M3 15h18M9 5v14',
+  fields: 'M4 6h10M4 12h16M4 18h7M18 4v4M16 6h4',
+  undo: 'M9 14 4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3',
+  refresh: 'M20 11a8 8 0 0 0-14.7-4.3L4 8M4 4v4h4M4 13a8 8 0 0 0 14.7 4.3L20 16M20 20v-4h-4',
+  up: 'M12 19V5M6 11l6-6 6 6',
+  down: 'M12 5v14M6 13l6 6 6-6',
+  sortAsc: 'M4 6h9M4 12h6M4 18h3M17 4v16M14 17l3 3 3-3',
+  sortDesc: 'M4 6h3M4 12h6M4 18h9M17 4v16M14 17l3 3 3-3',
 };
 
 export function icon(name, size = 20) {
@@ -145,6 +155,69 @@ export function choiceDialog(message, choices, { title = 'Valitse' } = {}) {
       onClose: () => resolve(result),
     });
   });
+}
+
+// ── Ponnahdusvalikko ────────────────────────────────────────────────────────
+// Läppärillä ankkurin alle aukeava valikko, kännykällä alhaalta nouseva arkki.
+let openPop = null;
+
+export function closePopover() {
+  openPop?.close();
+}
+
+export function openPopover(anchor, { title, body, onClose, className = '' }) {
+  closePopover();
+  if (matchMedia('(max-width: 759px)').matches) {
+    const d = openDialog({ title, body, onClose, className: `sheet-pop ${className}` });
+    openPop = { close: () => d.close(), el: d.dialog };
+    return openPop;
+  }
+  const pop = h('div', { class: `popover ${className}`, role: 'dialog', 'aria-label': title || '' },
+    title && h('div', { class: 'pop-head' }, h('strong', {}, title),
+      h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Sulje', onclick: () => api.close() }, icon('close', 16))),
+    h('div', { class: 'pop-body' }, body));
+  document.body.append(pop);
+
+  const place = () => {
+    const r = anchor.getBoundingClientRect();
+    const w = pop.offsetWidth;
+    const left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+    let top = r.bottom + 6;
+    const below = window.innerHeight - top - 12;
+    if (below < 280 && r.top > below) {
+      const maxH = Math.min(r.top - 18, 560);
+      pop.style.maxHeight = `${maxH}px`;
+      top = Math.max(8, r.top - 6 - Math.min(pop.scrollHeight, maxH));
+    } else {
+      pop.style.maxHeight = `${Math.min(below, 560)}px`;
+    }
+    pop.style.left = `${left}px`;
+    pop.style.top = `${top}px`;
+  };
+  place();
+
+  const onDown = (e) => { if (!pop.contains(e.target) && !anchor.contains(e.target)) api.close(); };
+  const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); api.close(); if (anchor.isConnected) anchor.focus(); } };
+  const onResize = () => api.close();
+  setTimeout(() => document.addEventListener('pointerdown', onDown, true));
+  document.addEventListener('keydown', onKey, true);
+  window.addEventListener('resize', onResize);
+
+  const api = {
+    el: pop,
+    close() {
+      if (!pop.isConnected) return;
+      pop.remove();
+      document.removeEventListener('pointerdown', onDown, true);
+      document.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('resize', onResize);
+      if (openPop === api) openPop = null;
+      onClose?.();
+    },
+  };
+  openPop = api;
+  (pop.querySelector('input[type="search"], input[type="text"]') || pop.querySelector('button'))?.focus({ preventScroll: true });
+  return api;
 }
 
 export function debounce(fn, ms) {

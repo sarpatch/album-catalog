@@ -56,24 +56,26 @@
   </header>
 
   <div class="toolbar">
-    <button id="filter-toggle" class="btn btn-small" type="button" aria-expanded="false" aria-controls="filters">
+    <button id="filter-toggle" class="btn btn-small" type="button">
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18l-7 8v6l-4-2v-4z"/></svg>Suodata
     </button>
-    <label class="sort"><span class="visually-hidden">Järjestys</span><select id="sort"></select></label>
+    <div class="sort-group">
+      <label class="sort"><span class="visually-hidden">Järjestä</span><select id="sort"></select></label>
+      <button id="sort-dir" class="icon-btn" type="button" aria-label="Järjestyksen suunta"></button>
+    </div>
+    <button id="btn-columns" class="btn btn-small" type="button" hidden>
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4zM9.5 4v16M14.5 4v16"/></svg><span class="lbl">Sarakkeet</span>
+    </button>
     <div class="view-toggle" role="group" aria-label="Näkymä">
-      <button type="button" class="icon-btn" data-view="grid" aria-label="Ruudukko" title="Ruudukko">
+      <button type="button" class="icon-btn" data-view="grid" aria-label="Kansinäkymä" title="Kansinäkymä">
         <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z"/></svg>
       </button>
-      <button type="button" class="icon-btn" data-view="list" aria-label="Lista" title="Lista">
-        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>
+      <button type="button" class="icon-btn" data-view="table" aria-label="Taulukko" title="Taulukko (muokattava)">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3zM3 10h18M3 15h18M9 5v14"/></svg>
       </button>
     </div>
   </div>
-  <div id="filters" class="filters" hidden>
-    <select id="f-genre" aria-label="Genre"></select>
-    <select id="f-format" aria-label="Formaatti"></select>
-    <select id="f-grade" aria-label="Kunto"></select>
-  </div>
+  <div id="chips" class="chips" hidden></div>
 
   <div id="banner" class="banner" hidden></div>
 

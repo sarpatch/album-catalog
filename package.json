@@ -1,6 +1,6 @@
 {
   "name": "lp-kokoelma",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "LP-levykokoelman hallinta – offline-toimiva PWA, CSV-tietolähde, kansikuvat ja pilvisynkronointi",
   "private": true,
   "type": "module",

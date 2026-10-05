@@ -1,0 +1,212 @@
+{
+  "_ohje": "Levyhyllyn kenttämäärittely. Muokkaa vapaasti – muutos näkyy sovelluksessa seuraavassa synkronoinnissa. Tyypit: text, textarea, number, money, date, select, grade, checkbox, rating, url. Ominaisuudet: key (pysyvä sarakkeen nimi CSV:ssä – älä muuta jälkikäteen), label (näkyvä nimi), type, group (lomakkeen osio), required, table (false = piilossa taulukosta oletuksena), hidden (true = piilota kokonaan, tiedot säilyvät), default, options ja colors (select), min, max, decimals, sum (summarivi), width (sarakkeen leveys px), aliases (tuonnin sarakenimet), help.",
+  "version": 1,
+  "updated_at": "",
+  "fields": [
+    {
+      "key": "artist",
+      "label": "Artisti",
+      "type": "text",
+      "group": "Perustiedot",
+      "required": true,
+      "width": 180,
+      "sortIgnoreArticles": true,
+      "aliases": ["artisti", "esittäjä", "yhtye"]
+    },
+    {
+      "key": "title",
+      "label": "Levyn nimi",
+      "type": "text",
+      "group": "Perustiedot",
+      "required": true,
+      "width": 210,
+      "aliases": ["nimi", "levy", "albumi", "album", "albumin nimi"]
+    },
+    {
+      "key": "status",
+      "label": "Status",
+      "type": "select",
+      "group": "Perustiedot",
+      "options": ["Tilattu", "Varastossa", "Myyty"],
+      "colors": { "Tilattu": "#2563eb", "Varastossa": "#16a34a", "Myyty": "#8a8580" },
+      "width": 120,
+      "default": "Varastossa",
+      "aliases": ["tila"]
+    },
+    {
+      "key": "year",
+      "label": "Vuosi",
+      "type": "number",
+      "group": "Julkaisu",
+      "min": 1890,
+      "max": 2100,
+      "decimals": 0,
+      "width": 105,
+      "aliases": ["vuosi", "released", "julkaisuvuosi"]
+    },
+    {
+      "key": "label",
+      "label": "Levy-yhtiö",
+      "type": "text",
+      "group": "Julkaisu",
+      "width": 140,
+      "aliases": ["levymerkki"]
+    },
+    {
+      "key": "catalog_number",
+      "label": "Tuotenumero",
+      "type": "text",
+      "group": "Julkaisu",
+      "width": 130,
+      "aliases": ["catalog#", "catno", "cat no", "catalog number"]
+    },
+    {
+      "key": "country",
+      "label": "Maa",
+      "type": "text",
+      "group": "Julkaisu",
+      "table": false
+    },
+    {
+      "key": "format",
+      "label": "Formaatti",
+      "type": "select",
+      "group": "Formaatti",
+      "options": ["LP", "EP", "Single", "Maxi-single", "Boksi", "Muu"],
+      "width": 110,
+      "default": "LP"
+    },
+    {
+      "key": "size",
+      "label": "Koko",
+      "type": "select",
+      "group": "Formaatti",
+      "options": ["12\"", "10\"", "7\""],
+      "table": false,
+      "default": "12\""
+    },
+    {
+      "key": "speed_rpm",
+      "label": "Nopeus (rpm)",
+      "type": "select",
+      "group": "Formaatti",
+      "options": ["33", "45", "78"],
+      "table": false,
+      "default": "33",
+      "aliases": ["speed", "rpm", "nopeus"]
+    },
+    {
+      "key": "discs",
+      "label": "Levyjä",
+      "type": "number",
+      "group": "Formaatti",
+      "table": false,
+      "min": 1,
+      "decimals": 0,
+      "sum": true,
+      "default": "1",
+      "aliases": ["levyjen määrä"]
+    },
+    {
+      "key": "genre",
+      "label": "Genre",
+      "type": "text",
+      "group": "Genre",
+      "width": 120
+    },
+    {
+      "key": "style",
+      "label": "Tyyli",
+      "type": "text",
+      "group": "Genre",
+      "table": false
+    },
+    {
+      "key": "media_grade",
+      "label": "Levyn kunto",
+      "type": "grade",
+      "group": "Kunto",
+      "width": 115,
+      "aliases": ["collection media condition", "media condition"]
+    },
+    {
+      "key": "sleeve_grade",
+      "label": "Kannen kunto",
+      "type": "grade",
+      "group": "Kunto",
+      "width": 120,
+      "aliases": ["collection sleeve condition", "sleeve condition"]
+    },
+    {
+      "key": "location",
+      "label": "Sijainti hyllyssä",
+      "type": "text",
+      "group": "Hankinta",
+      "width": 120,
+      "aliases": ["sijainti", "hylly", "collectionfolder"]
+    },
+    {
+      "key": "purchase_date",
+      "label": "Ostopäivä",
+      "type": "date",
+      "group": "Hankinta",
+      "width": 105,
+      "aliases": ["date added"]
+    },
+    {
+      "key": "purchase_price",
+      "label": "Ostohinta",
+      "type": "money",
+      "group": "Hankinta",
+      "min": 0,
+      "width": 100,
+      "aliases": ["hinta", "hinta (€)", "price"]
+    },
+    {
+      "key": "purchase_place",
+      "label": "Ostopaikka",
+      "type": "text",
+      "group": "Hankinta",
+      "table": false
+    },
+    {
+      "key": "sale_date",
+      "label": "Myyntipäivä",
+      "type": "date",
+      "group": "Myynti",
+      "width": 105
+    },
+    {
+      "key": "sale_price",
+      "label": "Myyntihinta",
+      "type": "money",
+      "group": "Myynti",
+      "min": 0,
+      "width": 100
+    },
+    {
+      "key": "barcode",
+      "label": "Viivakoodi",
+      "type": "text",
+      "group": "Muut",
+      "table": false,
+      "aliases": ["ean", "upc"]
+    },
+    {
+      "key": "discogs_id",
+      "label": "Discogs ID",
+      "type": "text",
+      "group": "Muut",
+      "table": false,
+      "aliases": ["release_id"]
+    },
+    {
+      "key": "notes",
+      "label": "Muistiinpanot",
+      "type": "textarea",
+      "group": "Muut",
+      "width": 240,
+      "aliases": ["huomiot", "collection notes"]
+    }
+  ]
+}

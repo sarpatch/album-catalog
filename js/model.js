@@ -1,67 +1,11 @@
-// Levyn tietomalli, validointi ja tuonnin kenttävastaavuudet.
+// Levyt: luonti, siistiminen, validointi, tuonti ja tilastot – kaikki kenttämäärittelyn mukaan.
 
-/** CSV-sarakkeet tässä järjestyksessä. Nimet englanniksi yhteensopivuuden vuoksi. */
-export const FIELDS = [
-  'id', 'artist', 'title', 'year', 'label', 'catalog_number', 'format', 'size',
-  'speed_rpm', 'discs', 'country', 'genre', 'style', 'media_grade', 'sleeve_grade',
-  'barcode', 'discogs_id', 'location', 'purchase_date', 'purchase_price',
-  'purchase_place', 'notes', 'cover_file', 'created_at', 'updated_at',
-];
+import {
+  SYSTEM_FIELDS, normalizeValue, validateValue, defaultValues, headerIndex, fieldMap, parseNumber,
+  compareValues, formatValue, uniqueKey, stripArticles,
+} from './schema.js';
 
-export const LABELS = {
-  artist: 'Artisti', title: 'Levyn nimi', year: 'Vuosi', label: 'Levy-yhtiö',
-  catalog_number: 'Tuotenumero', format: 'Formaatti', size: 'Koko', speed_rpm: 'Nopeus',
-  discs: 'Levyjä', country: 'Maa', genre: 'Genre', style: 'Tyyli',
-  media_grade: 'Levyn kunto', sleeve_grade: 'Kannen kunto', barcode: 'Viivakoodi',
-  discogs_id: 'Discogs ID', location: 'Sijainti hyllyssä', purchase_date: 'Ostopäivä',
-  purchase_price: 'Hinta (€)', purchase_place: 'Ostopaikka', notes: 'Muistiinpanot',
-};
-
-export const FORMATS = ['LP', 'EP', 'Single', 'Maxi-single', 'Boksi', 'Muu'];
-export const SIZES = ['12"', '10"', '7"'];
-export const SPEEDS = ['33', '45', '78'];
-
-/** Goldmine-kuntoluokitus – alan vakiintunut asteikko. */
-export const GRADES = [
-  { code: 'M', name: 'Mint', desc: 'Täysin uudenveroinen, avaamaton' },
-  { code: 'NM', name: 'Near Mint', desc: 'Lähes virheetön, ei näkyviä jälkiä' },
-  { code: 'VG+', name: 'Very Good Plus', desc: 'Vähäisiä käytön jälkiä, ei vaikuta soittoon' },
-  { code: 'VG', name: 'Very Good', desc: 'Näkyviä jälkiä, lievää rätinää hiljaisissa kohdissa' },
-  { code: 'G+', name: 'Good Plus', desc: 'Selvää kulumaa ja pintakohinaa, soi läpi' },
-  { code: 'G', name: 'Good', desc: 'Runsas kuluma, kuuntelukelpoinen' },
-  { code: 'F', name: 'Fair', desc: 'Vaurioitunut, hyppii tai rahisee pahoin' },
-  { code: 'P', name: 'Poor', desc: 'Lähes soittokelvoton' },
-];
-const GRADE_CODES = GRADES.map((g) => g.code);
-
-/** Tuonnin otsikkovastaavuudet: omat, suomenkieliset ja Discogs-viennin sarakkeet. */
-const ALIASES = {
-  artist: ['artist', 'artisti', 'esittäjä', 'yhtye'],
-  title: ['title', 'nimi', 'levy', 'albumi', 'levyn nimi', 'album'],
-  year: ['year', 'vuosi', 'released', 'julkaisuvuosi'],
-  label: ['label', 'levy-yhtiö', 'levymerkki'],
-  catalog_number: ['catalog_number', 'catalog#', 'catno', 'tuotenumero', 'cat no'],
-  format: ['format', 'formaatti'],
-  size: ['size', 'koko'],
-  speed_rpm: ['speed_rpm', 'speed', 'rpm', 'nopeus'],
-  discs: ['discs', 'levyjä', 'levyjen määrä'],
-  country: ['country', 'maa'],
-  genre: ['genre'],
-  style: ['style', 'tyyli'],
-  media_grade: ['media_grade', 'collection media condition', 'media condition', 'levyn kunto'],
-  sleeve_grade: ['sleeve_grade', 'collection sleeve condition', 'sleeve condition', 'kannen kunto'],
-  barcode: ['barcode', 'viivakoodi', 'ean', 'upc'],
-  discogs_id: ['discogs_id', 'release_id'],
-  location: ['location', 'sijainti', 'hylly', 'collectionfolder'],
-  purchase_date: ['purchase_date', 'ostopäivä', 'date added'],
-  purchase_price: ['purchase_price', 'hinta', 'ostohinta', 'price'],
-  purchase_place: ['purchase_place', 'ostopaikka'],
-  notes: ['notes', 'muistiinpanot', 'huomiot', 'collection notes'],
-  cover_file: ['cover_file', 'kansikuva'],
-  id: ['id'],
-  created_at: ['created_at'],
-  updated_at: ['updated_at'],
-};
+export { GRADES } from './schema.js';
 
 export function newId() {
   return globalThis.crypto?.randomUUID?.() ??
@@ -75,101 +19,92 @@ export function nowIso() {
   return new Date().toISOString();
 }
 
-export function emptyRecord() {
-  const r = Object.fromEntries(FIELDS.map((f) => [f, '']));
-  r.format = 'LP'; r.size = '12"'; r.speed_rpm = '33'; r.discs = '1';
+export function emptyRecord(schema) {
+  return { ...defaultValues(schema), cover_file: '' };
+}
+
+/** Siistii määrittelyn kentät; muut sarakkeet säilyvät sellaisinaan. */
+export function normalizeRecord(schema, input) {
+  const r = { ...input };
+  for (const f of schema.fields) r[f.key] = normalizeValue(f, input[f.key]);
   return r;
 }
 
-/** Normalisoi kuntoluokan, esim. "Very Good Plus (VG+)" → "VG+". */
-export function normalizeGrade(value) {
-  const v = String(value ?? '').trim();
-  if (!v) return '';
-  const paren = v.match(/\(([^)]+)\)/);
-  const candidate = (paren ? paren[1] : v).toUpperCase().replace(/\s+/g, '');
-  if (GRADE_CODES.includes(candidate)) return candidate;
-  const byName = GRADES.find((g) => g.name.toUpperCase() === v.toUpperCase());
-  return byName ? byName.code : candidate === 'EX' ? 'VG+' : '';
-}
-
-function normalizePrice(value) {
-  const v = String(value ?? '').trim().replace(/[€\s]/g, '').replace(',', '.');
-  if (!v) return '';
-  const n = Number(v);
-  return Number.isFinite(n) && n >= 0 ? n.toFixed(2) : String(value).trim();
-}
-
-function normalizeDate(value) {
-  const v = String(value ?? '').trim();
-  if (!v) return '';
-  const iso = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-  const fi = v.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
-  if (fi) return `${fi[3]}-${fi[2].padStart(2, '0')}-${fi[1].padStart(2, '0')}`;
-  return v;
-}
-
-/** Siistii kentät yhtenäiseen muotoon. Ei muuta id:tä eikä aikaleimoja. */
-export function normalizeRecord(input) {
-  const r = emptyRecord();
-  for (const f of FIELDS) if (input[f] != null) r[f] = String(input[f]).trim();
-  r.year = (r.year.match(/\d{4}/) || [''])[0];
-  r.media_grade = normalizeGrade(r.media_grade);
-  r.sleeve_grade = normalizeGrade(r.sleeve_grade);
-  r.purchase_price = normalizePrice(r.purchase_price);
-  r.purchase_date = normalizeDate(r.purchase_date);
-  r.speed_rpm = (r.speed_rpm.match(/\d+/) || [''])[0];
-  r.discs = (r.discs.match(/\d+/) || [''])[0];
-  return r;
-}
-
-/** Palauttaa virheet muodossa { kenttä: viesti }. Tyhjä olio = kelvollinen. */
-export function validateRecord(r) {
+/** @returns {Record<string,string>} kenttä → virheilmoitus */
+export function validateRecord(schema, r) {
   const errors = {};
-  if (!r.artist?.trim()) errors.artist = 'Artisti on pakollinen';
-  if (!r.title?.trim()) errors.title = 'Levyn nimi on pakollinen';
-  if (r.year) {
-    const y = Number(r.year);
-    const max = new Date().getFullYear() + 1;
-    if (!/^\d{4}$/.test(r.year) || y < 1890 || y > max) errors.year = `Vuoden pitää olla 1890–${max}`;
-  }
-  if (r.purchase_price && !/^\d+(\.\d{1,2})?$/.test(r.purchase_price)) {
-    errors.purchase_price = 'Anna hinta numerona, esim. 12,50';
-  }
-  if (r.purchase_date && !/^\d{4}-\d{2}-\d{2}$/.test(r.purchase_date)) {
-    errors.purchase_date = 'Päivämäärä muodossa vvvv-kk-pp';
-  }
-  if (r.discs && !(Number(r.discs) >= 1)) errors.discs = 'Vähintään 1';
-  for (const g of ['media_grade', 'sleeve_grade']) {
-    if (r[g] && !GRADE_CODES.includes(r[g])) errors[g] = 'Tuntematon kuntoluokka';
+  for (const f of schema.fields) {
+    if (f.hidden) continue;
+    const e = validateValue(f, r[f.key] ?? '');
+    if (e) errors[f.key] = e;
   }
   return errors;
 }
 
-/** Muuntaa tuodun rivin (vapaat otsikot) levyksi. Palauttaa null, jos rivi on tyhjä. */
-export function fromImportRow(row) {
-  const lowered = Object.fromEntries(
-    Object.entries(row).map(([k, v]) => [k.trim().toLowerCase(), v]),
-  );
-  const mapped = {};
-  for (const [field, names] of Object.entries(ALIASES)) {
-    const hit = names.find((n) => lowered[n] != null && String(lowered[n]).trim() !== '');
-    if (hit) mapped[field] = lowered[hit];
+/**
+ * Kohdistaa tuotavan tiedoston sarakeotsikot kenttiin (avain, nimi tai alias).
+ * @returns {{mapping: Map<string,string>, unknown: string[]}}
+ */
+export function mapHeaders(schema, headers) {
+  const idx = headerIndex(schema);
+  const mapping = new Map();
+  const unknown = [];
+  const used = new Set();
+  for (const h of headers) {
+    const name = String(h).trim();
+    if (!name) continue;
+    const key = idx.get(name.toLowerCase());
+    if (key && !used.has(key)) { mapping.set(h, key); used.add(key); } else if (!key) unknown.push(name);
   }
-  // Discogs: "Format" sisältää esim. "LP, Album" → tunnista formaatti
-  if (mapped.format && !FORMATS.includes(mapped.format)) {
-    const f = mapped.format.toUpperCase();
-    mapped.format = /BOX/.test(f) ? 'Boksi' : /\bEP\b/.test(f) ? 'EP'
-      : /\b7"|SINGLE/.test(f) ? 'Single' : /LP\b|ALBUM/.test(f) ? 'LP' : 'Muu';
-    const discs = String(row.Format ?? row.format ?? '').match(/(\d+)\s*[x×]?\s*LP/i);
-    if (discs && !mapped.discs) mapped.discs = discs[1];
+  return { mapping, unknown };
+}
+
+/** Luo tekstikentät tuntemattomille sarakkeille. */
+export function fieldsForHeaders(schema, headers) {
+  const taken = new Set(schema.fields.map((f) => f.key));
+  return headers.map((label) => {
+    const key = uniqueKey(taken, label);
+    taken.add(key);
+    return { key, label, type: 'text', group: 'Tuodut kentät', aliases: [label.toLowerCase()] };
+  });
+}
+
+// Discogsin "Format"-sarake on muotoa "2xLP, Album" tai "7\", Single".
+function discogsFormat(field, raw) {
+  const f = raw.toUpperCase();
+  const pick = /BOX/.test(f) ? 'Boksi' : /\bEP\b/.test(f) ? 'EP' : /\b7"|SINGLE/.test(f) ? 'Single'
+    : /LP\b|ALBUM/.test(f) ? 'LP' : null;
+  return pick && field.options.includes(pick) ? pick : raw;
+}
+
+/** Muuntaa tuodun rivin levyksi. Palauttaa null, jos artisti ja nimi puuttuvat. */
+export function fromImportRow(schema, row, mapping) {
+  const fields = fieldMap(schema);
+  const raw = {};
+  for (const [header, key] of mapping) {
+    const v = row[header];
+    if (v != null && String(v).trim() !== '') raw[key] = String(v);
   }
-  if (!mapped.artist && !mapped.title) return null;
-  const rec = normalizeRecord(mapped);
-  rec.id = mapped.id || newId();
-  rec.created_at = mapped.created_at || nowIso();
-  rec.updated_at = mapped.updated_at || rec.created_at;
-  return rec;
+  if (!raw.artist && !raw.title) return null;
+
+  const out = {};
+  for (const [key, v] of Object.entries(raw)) {
+    const f = fields.get(key);
+    if (!f) { out[key] = String(v).trim(); continue; }
+    let value = v;
+    if (key === 'format' && f.type === 'select' && !f.options.some((o) => o.toLowerCase() === v.trim().toLowerCase())) {
+      const discs = v.match(/(\d+)\s*[x×]\s*(LP|vinyl)/i);
+      if (discs && !raw.discs && fields.has('discs')) out.discs = discs[1];
+      value = discogsFormat(f, v);
+    }
+    out[key] = normalizeValue(f, value);
+  }
+  for (const f of schema.fields) if ((out[f.key] ?? '') === '' && f.default != null) out[f.key] = f.default;
+  out.id = raw.id || newId();
+  out.created_at = raw.created_at || nowIso();
+  out.updated_at = raw.updated_at || out.created_at;
+  out.cover_file = raw.cover_file || '';
+  return out;
 }
 
 /** Vertailuavain tuplien tunnistukseen. */
@@ -178,50 +113,60 @@ export function duplicateKey(r) {
   return `${norm(r.artist)}|${norm(r.title)}|${norm(r.catalog_number)}`;
 }
 
-/** Artistin lajitteluavain: "The Beatles" → "beatles". */
 export function sortKeyArtist(name) {
-  return String(name ?? '').trim().toLowerCase().replace(/^(the|a|an)\s+/, '');
+  return stripArticles(name).toLowerCase();
 }
-
-const collator = new Intl.Collator('fi', { numeric: true, sensitivity: 'base' });
-
-export const SORTS = {
-  artist: { label: 'Artisti A–Ö', cmp: (a, b) => collator.compare(sortKeyArtist(a.artist), sortKeyArtist(b.artist)) || (a.year || '9999').localeCompare(b.year || '9999') || collator.compare(a.title, b.title) },
-  title: { label: 'Levyn nimi A–Ö', cmp: (a, b) => collator.compare(a.title, b.title) },
-  year: { label: 'Vuosi (vanhin ensin)', cmp: (a, b) => (a.year || '9999').localeCompare(b.year || '9999') },
-  yearDesc: { label: 'Vuosi (uusin ensin)', cmp: (a, b) => (b.year || '0').localeCompare(a.year || '0') },
-  added: { label: 'Viimeksi lisätyt', cmp: (a, b) => b.created_at.localeCompare(a.created_at) },
-  location: { label: 'Sijainti', cmp: (a, b) => collator.compare(a.location, b.location) },
-};
 
 /** Vapaatekstihaku: kaikkien sanojen pitää löytyä jostain kentästä. */
 export function matchesQuery(r, query) {
-  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const words = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
   if (!words.length) return true;
-  const hay = [r.artist, r.title, r.label, r.catalog_number, r.genre, r.style, r.year,
-    r.country, r.location, r.notes, r.barcode].join(' ').toLowerCase();
+  let hay = '';
+  for (const [k, v] of Object.entries(r)) if (!SYSTEM_FIELDS.includes(k) && v) hay += ` ${String(v).toLowerCase()}`;
   return words.every((w) => hay.includes(w));
 }
 
-export function computeStats(records) {
-  const count = (key) => {
-    const m = new Map();
+const DISTRIBUTION_TYPES = ['select', 'grade', 'checkbox', 'rating'];
+
+export function computeStats(schema, records) {
+  const fields = fieldMap(schema);
+  const sum = (key) => records.reduce((s, r) => s + (parseNumber(r[key]) || 0), 0);
+
+  const distribution = (f, keyFn = (r) => r[f.key]) => {
+    const counts = new Map();
     for (const r of records) {
-      const k = typeof key === 'function' ? key(r) : r[key];
-      if (k) m.set(k, (m.get(k) || 0) + 1);
+      const k = keyFn(r);
+      if (k) counts.set(k, (counts.get(k) || 0) + 1);
     }
-    return [...m.entries()].sort((a, b) => b[1] - a[1]);
+    const entries = [...counts.entries()];
+    if (DISTRIBUTION_TYPES.includes(f.type)) entries.sort((a, b) => compareValues(f, a[0], b[0]));
+    else if (f.type === 'date') entries.sort((a, b) => a[0].localeCompare(b[0]));
+    else entries.sort((a, b) => b[1] - a[1]);
+    return entries.map(([k, n]) => [f.type === 'rating' || f.type === 'checkbox' ? formatValue(f, k) : k, n]);
   };
-  const value = records.reduce((s, r) => s + (Number(r.purchase_price) || 0), 0);
+
+  const distributions = [];
+  for (const f of schema.fields) {
+    if (f.hidden) continue;
+    if (DISTRIBUTION_TYPES.includes(f.type) || f.key === 'genre') {
+      const entries = distribution(f);
+      if (entries.length) distributions.push({ label: f.label, entries });
+    }
+    if (f.key === 'year') {
+      const entries = distribution({ type: 'date' }, (r) => {
+        const y = parseNumber(r.year);
+        return Number.isNaN(y) ? '' : `${Math.floor(y / 10) * 10}-luku`;
+      });
+      if (entries.length) distributions.push({ label: 'Vuosikymmenet', entries, all: true });
+    }
+  }
+
   return {
     total: records.length,
-    discs: records.reduce((s, r) => s + (Number(r.discs) || 1), 0),
+    discs: fields.has('discs') ? records.reduce((s, r) => s + (parseNumber(r.discs) || 1), 0) : records.length,
     artists: new Set(records.map((r) => sortKeyArtist(r.artist))).size,
-    value,
     withCover: records.filter((r) => r.cover_file).length,
-    byGenre: count('genre'),
-    byDecade: count((r) => (r.year ? `${r.year.slice(0, 3)}0-luku` : '')).sort((a, b) => a[0].localeCompare(b[0])),
-    byFormat: count('format'),
-    byGrade: count('media_grade'),
+    money: schema.fields.filter((f) => f.type === 'money' && !f.hidden).map((f) => ({ label: f.label, value: sum(f.key) })),
+    distributions,
   };
 }
