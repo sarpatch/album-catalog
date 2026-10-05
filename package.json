@@ -1,5 +1,5 @@
 {
-  "name": "lp-kokoelma",
+  "name": "album-catalog",
   "version": "1.1.0",
   "description": "LP-levykokoelman hallinta – offline-toimiva PWA, CSV-tietolähde, kansikuvat ja pilvisynkronointi",
   "private": true,

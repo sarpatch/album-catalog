@@ -1,5 +1,7 @@
 # Levyhylly – LP-kokoelman hallinta
 
+**Sovellus:** https://sarpatch.github.io/album-catalog/
+
 Selaimessa toimiva, asennettava sovellus (PWA) LP-levykokoelman hallintaan. Toimii kännykällä ja läppärillä, myös ilman verkkoyhteyttä. Tietolähteenä on **CSV-tiedosto**, ja kansikuvat ovat tavallisia JPEG-tiedostoja. Tiedot voi pitää laitteella, omassa kansiossa, **Dropboxissa** tai **Google Drivessa**, ja tallennuspaikkaa voi vaihtaa milloin tahansa.
 
 ![Taulukkonäkymä: suodatus statuksen mukaan, lajittelu vuoden mukaan](docs/table.png)
@@ -36,7 +38,7 @@ Sovellus on pelkkiä staattisia tiedostoja, eikä se vaadi käännösvaihetta ta
 
 1. Puske repo GitHubiin.
 2. Valitse **Settings → Pages → Build and deployment → Source: GitHub Actions**.
-3. Mukana oleva työnkulku (`.github/workflows/pages.yml`) ajaa testit ja julkaisee sovelluksen osoitteeseen `https://<käyttäjä>.github.io/<repo>/`.
+3. Mukana oleva työnkulku (`.github/workflows/pages.yml`) ajaa testit ja julkaisee sovelluksen osoitteeseen https://sarpatch.github.io/album-catalog/.
 4. Avaa osoite kännykällä ja valitse selaimen valikosta **Lisää aloitusnäyttöön** (Android: *Asenna sovellus*). Läppärin Chromessa asennuspainike on osoiterivillä.
 
 Paikallinen kokeilu: `npm start` (tai `python3 -m http.server 8080`) ja selaimella `http://localhost:8080`.
@@ -46,7 +48,7 @@ Paikallinen kokeilu: `npm start` (tai `python3 -m http.server 8080`) ja selaimel
 1. Avaa [dropbox.com/developers/apps](https://www.dropbox.com/developers/apps) → **Create app**.
 2. Valitse *Scoped access* → **App folder**. Anna nimi, esim. `Levyhylly`.
 3. Lisää **Permissions**-välilehdellä oikeudet `files.content.write` ja `files.content.read` ja paina *Submit*.
-4. Lisää **Settings**-välilehdellä kohtaan *OAuth 2 → Redirect URIs* sovelluksen osoite tarkalleen, esim. `https://kayttaja.github.io/lp-kokoelma/`. Lisää kehitystä varten myös `http://localhost:8080/`.
+4. Lisää **Settings**-välilehdellä kohtaan *OAuth 2 → Redirect URIs* sovelluksen osoite tarkalleen, `https://sarpatch.github.io/album-catalog/`. Lisää kehitystä varten myös `http://localhost:8080/`.
 5. Kopioi **App key**. Liitä se joko sovelluksen *Asetukset → Pilvipalveluiden avaimet* -kohtaan tai pysyvästi tiedostoon `js/config.js`, jolloin sitä ei tarvitse syöttää joka laitteella.
 6. Valitse *Asetukset → Tallennuspaikka → Dropbox* ja kirjaudu.
 
@@ -57,7 +59,7 @@ Tiedostot tulevat Dropboxiin kansioon *Sovellukset / Levyhylly / LP-kokoelma*.
 1. Luo projekti [Google Cloud Consolessa](https://console.cloud.google.com/).
 2. Valitse **APIs & Services → Library** ja ota käyttöön **Google Drive API**.
 3. Valitse **OAuth consent screen**: *External*, täytä nimi ja sähköposti. Lisää scope `.../auth/drive.file` ja lisää itsesi kohtaan *Test users*.
-4. Valitse **Credentials → Create credentials → OAuth client ID → Web application**. Lisää kohtaan *Authorized JavaScript origins* sovelluksen alkuperä, esim. `https://kayttaja.github.io`, sekä `http://localhost:8080`.
+4. Valitse **Credentials → Create credentials → OAuth client ID → Web application**. Lisää kohtaan *Authorized JavaScript origins* sovelluksen alkuperä, `https://sarpatch.github.io`, sekä `http://localhost:8080`.
 5. Kopioi **Client ID** (`…apps.googleusercontent.com`) asetuksiin tai tiedostoon `js/config.js`.
 6. Valitse *Asetukset → Tallennuspaikka → Google Drive*.
 
